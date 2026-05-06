@@ -1,8 +1,7 @@
 import os
 import json
 import logging
-from collections import deque
-from datetime import datetime
+import urllib.request
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 
@@ -13,11 +12,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 CONFIG_FILE = "config.json"
 
-CHAIN_THRESHOLD = 3
-CHAIN_EXPIRY = 120
-BUFFER_SIZE = 10
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-2.5-flash-lite:generateContent?key=" + GEMINI_API_KEY
+)
 
 
 # --- Config (in-memory cache, disk only on write) ---
@@ -48,64 +49,52 @@ def get_alpha_config():
     return None, None
 
 
-# --- Conversation chain tracker ---
+# --- Gemini classifier ---
 
-# Each entry: (user_id, user_obj, chat_id, msg_id, timestamp)
-message_buffer: deque = deque(maxlen=BUFFER_SIZE)
+def is_chat_message(text: str) -> bool:
+    prompt = (
+        "You are a moderator for a private crypto alpha channel on Telegram. "
+        "This channel is strictly for sharing trading signals, market intelligence, and crypto analysis. "
+        "Your job is to classify each message as CHAT or ALPHA.\n\n"
+        "CHAT — delete these:\n"
+        "- Greetings and reactions: gm, gg, nice, lol, wagmi, lets go, fire\n"
+        "- Personal opinions with no data: I think BTC is going up\n"
+        "- Questions to other members: did you see that?, what do you think?\n"
+        "- Off-topic talk: anything not directly related to a trade, token, or market event\n"
+        "- Hype with no substance: this is huge, moon soon\n\n"
+        "ALPHA — keep these:\n"
+        "- Contract addresses or token tickers with context\n"
+        "- Wallet activity: whale wallet 0x... just bought 500k\n"
+        "- Price levels and setups: SOL holding $180 support, watching for breakout\n"
+        "- On-chain data or exchange data\n"
+        "- News that directly affects a token or market\n"
+        "- Chart analysis with specific observations\n\n"
+        "When in doubt, classify as ALPHA. Only classify as CHAT if it is clearly casual with zero trading value.\n\n"
+        "Reply with exactly one word: CHAT or ALPHA.\n\n"
+        f"Message: {text}"
+    )
 
-# Key: frozenset(uid1, uid2)
-# Value: {"messages": [(chat_id, msg_id, user_obj, timestamp)], "last_activity": datetime}
-conversation_chains: dict = {}
+    body = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": 10, "temperature": 0}
+    }).encode("utf-8")
 
+    req = urllib.request.Request(
+        GEMINI_URL,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
 
-def cleanup_chains():
-    now = datetime.now()
-    expired = [
-        key for key, val in conversation_chains.items()
-        if (now - val["last_activity"]).total_seconds() > CHAIN_EXPIRY
-    ]
-    for key in expired:
-        del conversation_chains[key]
-
-
-def find_recent_partner(current_user_id: int):
-    """
-    Only return a partner if the LAST message in the buffer is from a different user.
-    This ensures we only track genuine alternating back-and-forth exchanges.
-    """
-    if not message_buffer:
-        return None
-
-    last_uid, _, _, _, last_ts = message_buffer[-1]
-
-    if last_uid != current_user_id:
-        if (datetime.now() - last_ts).total_seconds() <= CHAIN_EXPIRY:
-            return last_uid
-
-    return None
-
-
-def track_chain(user, chat_id: int, msg_id: int, partner_id: int) -> list:
-    cleanup_chains()
-
-    pair = frozenset([user.id, partner_id])
-    now = datetime.now()
-
-    if pair not in conversation_chains:
-        conversation_chains[pair] = {"messages": [], "last_activity": now}
-
-    conversation_chains[pair]["messages"].append((chat_id, msg_id, user, now))
-    conversation_chains[pair]["last_activity"] = now
-
-    logger.info(f"Chain {set(pair)}: {len(conversation_chains[pair]['messages'])} msgs")
-
-    if len(conversation_chains[pair]["messages"]) >= CHAIN_THRESHOLD:
-        # Only take the last 2 messages, leave the rest
-        last_two = [(m[0], m[1], m[2]) for m in conversation_chains[pair]["messages"][-2:]]
-        del conversation_chains[pair]
-        return last_two
-
-    return []
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+            answer = data["candidates"][0]["content"]["parts"][0]["text"].strip().upper()
+            logger.info(f"Gemini classified: {answer} — {text[:60]}")
+            return answer == "CHAT"
+    except Exception as e:
+        logger.error(f"Gemini API error: {e}")
+        return False  # On error, don't delete
 
 
 # --- Commands ---
@@ -204,7 +193,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         return
 
-    # Layer 1: explicit reply to someone else
+    # Layer 1: explicit reply to someone else — instant delete, no AI needed
     if message.reply_to_message is not None:
         original_sender = message.reply_to_message.from_user
         if original_sender and original_sender.id != user.id:
@@ -216,32 +205,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Delete failed: {e}")
             return
 
-    # Layer 3: chain detection
-    partner_id = find_recent_partner(user.id)
-    message_buffer.append((user.id, user, message.chat_id, message.message_id, datetime.now()))
+    # Layer 2: skip media-only messages (charts, screenshots — likely alpha)
+    if not message.text:
+        return
 
-    if partner_id is not None:
-        to_delete = track_chain(user, message.chat_id, message.message_id, partner_id)
-
-        if to_delete:
-            logger.info(f"Chain hit. Deleting last 2 messages.")
-
-            # Notify only the 2 users whose messages are being deleted
-            notified = set()
-            users_to_notify = []
-            for _, _, u in to_delete:
-                if u.id not in notified:
-                    notified.add(u.id)
-                    users_to_notify.append(u)
-
-            for chat_id, msg_id, _ in to_delete:
-                try:
-                    await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
-                except Exception as e:
-                    logger.error(f"Failed to delete msg {msg_id}: {e}")
-
-            for u in users_to_notify:
-                await notify_user(context, u)
+    # Layer 3: Gemini classification
+    if is_chat_message(message.text):
+        try:
+            await message.delete()
+            logger.info(f"Deleted chat message from @{user.username or user.id}")
+            await notify_user(context, user)
+        except Exception as e:
+            logger.error(f"Delete failed: {e}")
 
 
 def main():
