@@ -69,11 +69,19 @@ def cleanup_chains():
 
 
 def find_recent_partner(current_user_id: int):
-    for entry in reversed(message_buffer):
-        uid, _, _, _, ts = entry
-        if uid != current_user_id:
-            if (datetime.now() - ts).total_seconds() <= CHAIN_EXPIRY:
-                return uid
+    """
+    Only return a partner if the LAST message in the buffer is from a different user.
+    This ensures we only track genuine alternating back-and-forth exchanges.
+    """
+    if not message_buffer:
+        return None
+
+    last_uid, _, _, _, last_ts = message_buffer[-1]
+
+    if last_uid != current_user_id:
+        if (datetime.now() - last_ts).total_seconds() <= CHAIN_EXPIRY:
+            return last_uid
+
     return None
 
 
