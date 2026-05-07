@@ -45,6 +45,15 @@ STRONG_ALPHA_RE = re.compile(
     re.IGNORECASE,
 )
 
+ANNOUNCEMENT_RE = re.compile(
+    r"\b("
+    r"announcement|announce|announcing|update|official|notice|heads up|reminder|schedule|scheduled|"
+    r"ama|space|spaces|livestream|live stream|call starts|starting soon|mint|snapshot|claim|"
+    r"partnership|migration|maintenance|launch time|listing time|deadline|thread rules"
+    r")\b",
+    re.IGNORECASE,
+)
+
 
 # --- Config ---
 
@@ -168,7 +177,7 @@ def parse_gemini_json(answer: str) -> dict:
 # --- Gemini moderation ---
 
 def has_strong_alpha_signal(text: str) -> bool:
-    return bool(STRONG_ALPHA_RE.search(text))
+    return bool(STRONG_ALPHA_RE.search(text) or ANNOUNCEMENT_RE.search(text))
 
 
 def gemini_should_delete(
@@ -196,6 +205,7 @@ def gemini_should_delete(
         "- back-and-forth talk that does not add a trade idea, market fact, token detail, risk note, or useful question\n\n"
         "KEEP the current message if it has any alpha value, even if it is short or conversational:\n"
         "- contract address, ticker, wallet, link, chart, price level, entry, target, support, resistance, volume, mcap, holders, news, on-chain data\n"
+        "- announcements, official notices, reminders, schedules, AMAs, spaces, launches, listings, claims, migrations, maintenance, or rule updates\n"
         "- a useful alpha question such as asking for CA, entry, mcap, source, wallet, timeframe, risk, chart, or confirmation\n"
         "- a short follow-up that changes a trade decision, such as 'wait for pullback', 'entry here', 'dev sold', 'volume coming in', 'not buying yet'\n"
         "- anything ambiguous. When unsure, KEEP.\n\n"
@@ -367,6 +377,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Media-only messages are usually charts/screenshots and are kept.
     if not text:
         add_to_buffer(message, "[media-only message]", deleted=False)
+        return
+
+    # Admins often use alpha threads for announcements and pinned-style updates.
+    if await is_admin(update):
+        add_to_buffer(message, text, deleted=False)
         return
 
     context_items = get_context_before(message)
