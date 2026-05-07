@@ -1,50 +1,74 @@
-import os
+import asyncio
 import json
 import logging
+import os
+import re
+import time
 import urllib.request
-from collections import deque
-from datetime import datetime
+from collections import defaultdict, deque
+
 from telegram import Update
-from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 CONFIG_FILE = "config.json"
+
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     "gemini-2.5-flash-lite:generateContent?key=" + GEMINI_API_KEY
 )
 
-CHAIN_THRESHOLD = 3
-CHAIN_EXPIRY = 120
-BUFFER_SIZE = 10
+BUFFER_LIMIT = int(os.getenv("BUFFER_LIMIT", "12"))
+BUFFER_TTL_SECONDS = int(os.getenv("BUFFER_TTL_SECONDS", "600"))
+DELETE_CONFIDENCE_THRESHOLD = float(os.getenv("DELETE_CONFIDENCE_THRESHOLD", "0.82"))
+GEMINI_TIMEOUT_SECONDS = int(os.getenv("GEMINI_TIMEOUT_SECONDS", "8"))
+
+STRONG_ALPHA_RE = re.compile(
+    r"("
+    r"0x[a-fA-F0-9]{40}"
+    r"|https?://\S+"
+    r"|\$[A-Za-z][A-Za-z0-9_]{1,12}\b"
+    r"|\b[A-HJ-NP-Za-km-z1-9]{32,44}\b"
+    r"|\b\d+(\.\d+)?\s?%"
+    r"|\$\s?\d+(\.\d+)?"
+    r"|\b(ca|contract|address|entry|target|targets|tp|sl|stop loss|support|resistance|breakout|retest|mcap|market cap|fdv|holders|liquidity|volume|whale|wallet|dex|cex|listing|launch|unlock|burn|airdrop|claim|funding|open interest|smart money)\b"
+    r")",
+    re.IGNORECASE,
+)
 
 
 # --- Config ---
 
 _config: dict = {}
 
+
 def load_config():
     global _config
     if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r") as f:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             _config = json.load(f)
     else:
         _config = {}
 
+
 def save_config():
-    with open(CONFIG_FILE, "w") as f:
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(_config, f)
+
 
 def get_notify_chat_id():
     val = _config.get("notify_chat_id")
     return int(val) if val is not None else None
+
 
 def get_alpha_config():
     chat_id = _config.get("alpha_chat_id")
@@ -54,110 +78,191 @@ def get_alpha_config():
     return None, None
 
 
-# --- Gemini classifier ---
+# --- Rolling context ---
 
-def is_conversation_chain(buffer: list, chain: list) -> bool:
-    """
-    Send the full message buffer to Gemini for context, highlighting the chain.
-    Returns True only if the chain is purely casual conversation with zero alpha.
-    """
-    buffer_text = "\n".join(
-        f"{i+1}. {text}" for i, (_, _, _, _, _, text) in enumerate(buffer) if text
+thread_buffers = defaultdict(lambda: deque(maxlen=BUFFER_LIMIT))
+
+
+def message_text(message) -> str:
+    return (message.text or message.caption or "").strip()
+
+
+def thread_key(message):
+    return message.chat_id, message.message_thread_id
+
+
+def prune_buffer(buf, now: float):
+    while buf and now - buf[0]["ts"] > BUFFER_TTL_SECONDS:
+        buf.popleft()
+
+
+def add_to_buffer(message, text: str, deleted: bool):
+    user = message.from_user
+    if not user or not text:
+        return
+
+    now = time.time()
+    buf = thread_buffers[thread_key(message)]
+    prune_buffer(buf, now)
+    buf.append(
+        {
+            "message_id": message.message_id,
+            "user_id": user.id,
+            "text": text[:1200],
+            "deleted": deleted,
+            "is_reply": message.reply_to_message is not None,
+            "ts": now,
+        }
     )
-    chain_text = "\n".join(
-        f"- {text}" for _, _, _, _, text in chain if text
-    )
+
+
+def get_context_before(message):
+    now = time.time()
+    buf = thread_buffers[thread_key(message)]
+    prune_buffer(buf, now)
+    return list(buf)
+
+
+def user_aliases(context_items, current_user_id, reply_user_id=None):
+    aliases = {}
+
+    def alias(uid):
+        if uid is None:
+            return "Unknown"
+        if uid == current_user_id:
+            return "CURRENT_USER"
+        if uid not in aliases:
+            aliases[uid] = f"USER_{len(aliases) + 1}"
+        return aliases[uid]
+
+    for item in context_items:
+        alias(item["user_id"])
+    alias(reply_user_id)
+    return alias
+
+
+def format_context(context_items, current_user_id, reply_user_id=None):
+    alias = user_aliases(context_items, current_user_id, reply_user_id)
+    lines = []
+    for item in context_items[-BUFFER_LIMIT:]:
+        state = "deleted earlier" if item["deleted"] else "visible"
+        reply_tag = " reply" if item["is_reply"] else ""
+        lines.append(f"- {alias(item['user_id'])}{reply_tag} ({state}): {item['text']}")
+    return "\n".join(lines) if lines else "- No recent context."
+
+
+def parse_gemini_json(answer: str) -> dict:
+    answer = answer.strip()
+    try:
+        return json.loads(answer)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", answer, re.DOTALL)
+        if not match:
+            return {}
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return {}
+
+
+# --- Gemini moderation ---
+
+def has_strong_alpha_signal(text: str) -> bool:
+    return bool(STRONG_ALPHA_RE.search(text))
+
+
+def gemini_should_delete(
+    text: str,
+    context_items,
+    reply_text: str | None,
+    reply_user_id: int | None,
+    current_user_id: int,
+) -> tuple[bool, str]:
+    if has_strong_alpha_signal(text):
+        return False, "strong alpha signal"
+
+    reply_section = "None"
+    if reply_text:
+        alias = user_aliases(context_items, current_user_id, reply_user_id)
+        reply_section = f"{alias(reply_user_id)}: {reply_text[:1200]}"
 
     prompt = (
-        "You are a moderator for a private crypto alpha channel on Telegram. "
-        "This channel is strictly for trading signals, market intelligence, and crypto analysis.\n\n"
-        "Here are the last messages posted in the channel (for context):\n"
-        f"{buffer_text}\n\n"
-        "The following messages specifically triggered a conversation alert:\n"
-        f"{chain_text}\n\n"
-        "Using the full context above, decide if the flagged messages are casual conversation with NO trading value.\n\n"
-        "Answer YES if ALL of the following are true:\n"
-        "- The flagged messages are back-and-forth casual chat (greetings, reactions, opinions, off-topic talk)\n"
-        "- There are NO contract addresses, token tickers with analysis, price levels, wallet activity, or market signals\n\n"
-        "Answer NO if ANY flagged message contains alpha — even one signal means the whole chain is kept.\n\n"
-        "When in doubt, answer NO.\n\n"
-        "Reply with exactly one word: YES or NO."
+        "You are moderating a Telegram crypto alpha thread.\n"
+        "The goal is to remove regular chat from the alpha thread, not only two-person conversations.\n"
+        "Judge ONLY the CURRENT_MESSAGE. Use RECENT_CONTEXT and REPLY_TARGET only to understand whether the current message adds alpha value.\n\n"
+        "DELETE the current message only if it is clearly regular chat with no useful alpha value:\n"
+        "- greetings, jokes, memes, thanks, reactions, hype, emojis, casual comments\n"
+        "- vague social messages like 'gm', 'lol', 'nice', 'lfg', 'send it', 'crazy', 'what do you think?'\n"
+        "- back-and-forth talk that does not add a trade idea, market fact, token detail, risk note, or useful question\n\n"
+        "KEEP the current message if it has any alpha value, even if it is short or conversational:\n"
+        "- contract address, ticker, wallet, link, chart, price level, entry, target, support, resistance, volume, mcap, holders, news, on-chain data\n"
+        "- a useful alpha question such as asking for CA, entry, mcap, source, wallet, timeframe, risk, chart, or confirmation\n"
+        "- a short follow-up that changes a trade decision, such as 'wait for pullback', 'entry here', 'dev sold', 'volume coming in', 'not buying yet'\n"
+        "- anything ambiguous. When unsure, KEEP.\n\n"
+        "Return only JSON with this shape:\n"
+        "{\"action\":\"DELETE\" or \"KEEP\", \"confidence\":0.0-1.0, \"reason\":\"short reason\"}\n\n"
+        f"RECENT_CONTEXT:\n{format_context(context_items, current_user_id, reply_user_id)}\n\n"
+        f"REPLY_TARGET:\n{reply_section}\n\n"
+        f"CURRENT_MESSAGE:\nCURRENT_USER: {text[:1600]}"
     )
 
-    body = json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"maxOutputTokens": 10, "temperature": 0}
-    }).encode("utf-8")
+    body = json.dumps(
+        {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "maxOutputTokens": 120,
+                "temperature": 0,
+                "responseMimeType": "application/json",
+            },
+        }
+    ).encode("utf-8")
 
     req = urllib.request.Request(
         GEMINI_URL,
         data=body,
         headers={"Content-Type": "application/json"},
-        method="POST"
+        method="POST",
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT_SECONDS) as resp:
             data = json.loads(resp.read())
-            answer = data["candidates"][0]["content"]["parts"][0]["text"].strip().upper()
-            logger.info(f"Gemini chain verdict: {answer}")
-            return answer == "YES"
+            answer = data["candidates"][0]["content"]["parts"][0]["text"]
+            verdict = parse_gemini_json(answer)
     except Exception as e:
         logger.error(f"Gemini API error: {e}")
-        return False  # On error, don't delete
+        return False, "gemini error"
+
+    action = str(verdict.get("action", "")).upper()
+    try:
+        confidence = float(verdict.get("confidence", 0))
+    except (TypeError, ValueError):
+        confidence = 0
+    reason = str(verdict.get("reason", "no reason"))
+
+    logger.info(f"Gemini verdict={action} confidence={confidence:.2f} reason={reason} text={text[:80]}")
+    should_delete = action == "DELETE" and confidence >= DELETE_CONFIDENCE_THRESHOLD
+    return should_delete, reason
 
 
-# --- Chain tracker ---
+async def should_delete_message(message, text: str, context_items) -> tuple[bool, str]:
+    user = message.from_user
+    reply_text = None
+    reply_user_id = None
 
-# Each entry: (user_id, user_obj, chat_id, msg_id, timestamp, text)
-message_buffer: deque = deque(maxlen=BUFFER_SIZE)
+    if message.reply_to_message:
+        reply_text = message_text(message.reply_to_message)
+        if message.reply_to_message.from_user:
+            reply_user_id = message.reply_to_message.from_user.id
 
-# Key: frozenset(uid1, uid2)
-# Value: {"messages": [(chat_id, msg_id, user_obj, timestamp, text)], "last_activity": datetime}
-conversation_chains: dict = {}
-
-
-def cleanup_chains():
-    now = datetime.now()
-    expired = [
-        key for key, val in conversation_chains.items()
-        if (now - val["last_activity"]).total_seconds() > CHAIN_EXPIRY
-    ]
-    for key in expired:
-        del conversation_chains[key]
-
-
-def find_recent_partner(current_user_id: int):
-    if not message_buffer:
-        return None
-    last_uid, _, _, _, last_ts, _ = message_buffer[-1]
-    if last_uid != current_user_id:
-        if (datetime.now() - last_ts).total_seconds() <= CHAIN_EXPIRY:
-            return last_uid
-    return None
-
-
-def track_chain(user, chat_id: int, msg_id: int, partner_id: int, text: str) -> list:
-    cleanup_chains()
-
-    pair = frozenset([user.id, partner_id])
-    now = datetime.now()
-
-    if pair not in conversation_chains:
-        conversation_chains[pair] = {"messages": [], "last_activity": now}
-
-    conversation_chains[pair]["messages"].append((chat_id, msg_id, user, now, text))
-    conversation_chains[pair]["last_activity"] = now
-
-    logger.info(f"Chain {set(pair)}: {len(conversation_chains[pair]['messages'])} msgs")
-
-    if len(conversation_chains[pair]["messages"]) >= CHAIN_THRESHOLD:
-        # Take last 2, verify with Gemini before deleting
-        last_three = conversation_chains[pair]["messages"][-3:]
-        del conversation_chains[pair]
-        return last_three
-
-    return []
+    return await asyncio.to_thread(
+        gemini_should_delete,
+        text,
+        context_items,
+        reply_text,
+        reply_user_id,
+        user.id,
+    )
 
 
 # --- Commands ---
@@ -171,20 +276,25 @@ async def cmd_setalpha(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update):
         await update.message.reply_text("Admins only.")
         return
+
     thread_id = update.message.message_thread_id
     if thread_id is None:
         await update.message.reply_text("Run this command inside a forum thread.")
         return
+
     _config["alpha_chat_id"] = update.message.chat_id
     _config["alpha_thread_id"] = thread_id
     save_config()
+
     await update.message.reply_text("Done. This thread is now being monitored.")
+    logger.info(f"Alpha thread set: chat={update.message.chat_id}, thread={thread_id}")
 
 
 async def cmd_clearalpha(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update):
         await update.message.reply_text("Admins only.")
         return
+
     _config.pop("alpha_chat_id", None)
     _config.pop("alpha_thread_id", None)
     save_config()
@@ -195,6 +305,7 @@ async def cmd_setnotify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update):
         await update.message.reply_text("Admins only.")
         return
+
     _config["notify_chat_id"] = update.effective_chat.id
     save_config()
     await update.message.reply_text(
@@ -206,17 +317,19 @@ async def cmd_clearnotify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update):
         await update.message.reply_text("Admins only.")
         return
+
     _config.pop("notify_chat_id", None)
     save_config()
     await update.message.reply_text("Notifications disabled.")
 
 
-# --- Notify helper ---
+# --- Notifications ---
 
 async def notify_user(context: ContextTypes.DEFAULT_TYPE, user):
     notify_chat_id = get_notify_chat_id()
     if notify_chat_id is None:
         return
+
     try:
         mention = f"@{user.username}" if user.username else f'<a href="tg://user?id={user.id}">{user.first_name}</a>'
         await context.bot.send_message(
@@ -225,7 +338,7 @@ async def notify_user(context: ContextTypes.DEFAULT_TYPE, user):
                 f"{mention} your message was removed from the alpha channel.\n"
                 f"Please keep general conversation here."
             ),
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
     except Exception as e:
         logger.error(f"Notify failed for {user.id}: {e}")
@@ -249,51 +362,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         return
 
-    # Layer 1: explicit reply to someone else — instant delete, no AI
-    if message.reply_to_message is not None:
-        original_sender = message.reply_to_message.from_user
-        if original_sender and original_sender.id != user.id:
-            try:
-                await message.delete()
-                logger.info(f"Deleted explicit reply from @{user.username or user.id}")
-                await notify_user(context, user)
-            except Exception as e:
-                logger.error(f"Delete failed: {e}")
-            return
+    text = message_text(message)
 
-    # Layer 2: chain detection — only text messages tracked
-    text = message.text or ""
-    partner_id = find_recent_partner(user.id)
-    message_buffer.append((user.id, user, message.chat_id, message.message_id, datetime.now(), text))
+    # Media-only messages are usually charts/screenshots and are kept.
+    if not text:
+        add_to_buffer(message, "[media-only message]", deleted=False)
+        return
 
-    if partner_id is not None:
-        candidates = track_chain(user, message.chat_id, message.message_id, partner_id, text)
+    context_items = get_context_before(message)
+    delete, reason = await should_delete_message(message, text, context_items)
 
-        if candidates:
-            # Send full buffer to Gemini for context-aware judgment
-            buffer_snapshot = list(message_buffer)
-            if is_conversation_chain(buffer_snapshot, candidates):
-                # Delete only the last 2 messages in the chain
-                to_delete = [(m[0], m[1], m[2]) for m in candidates[-2:]]
-                logger.info(f"Chain confirmed as chat. Deleting last 2 messages.")
+    if delete:
+        try:
+            await message.delete()
+            logger.info(f"Deleted regular chat from @{user.username or user.id}: {reason}")
+            await notify_user(context, user)
+            add_to_buffer(message, text, deleted=True)
+        except Exception as e:
+            logger.error(f"Delete failed: {e}")
+            add_to_buffer(message, text, deleted=False)
+        return
 
-                notified = set()
-                users_to_notify = []
-                for _, _, u in to_delete:
-                    if u.id not in notified:
-                        notified.add(u.id)
-                        users_to_notify.append(u)
-
-                for chat_id, msg_id, _ in to_delete:
-                    try:
-                        await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
-                    except Exception as e:
-                        logger.error(f"Failed to delete msg {msg_id}: {e}")
-
-                for u in users_to_notify:
-                    await notify_user(context, u)
-            else:
-                logger.info("Chain contains alpha — nothing deleted.")
+    add_to_buffer(message, text, deleted=False)
 
 
 def main():
