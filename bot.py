@@ -19,13 +19,11 @@ logger = logging.getLogger(__name__)
 
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+# === GROK API (xAI) ===
+GROK_API_KEY = os.environ["GROK_API_KEY"]
+GROK_URL = "https://api.x.ai/v1/chat/completions"
+GROK_MODEL = "grok-3"  # or "grok-3-mini" — check your console.x.ai for the latest available model
 CONFIG_FILE = "config.json"
-
-GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-2.5-flash-lite:generateContent?key=" + GEMINI_API_KEY
-)
 
 BUFFER_LIMIT = int(os.getenv("BUFFER_LIMIT", "12"))
 BUFFER_TTL_SECONDS = int(os.getenv("BUFFER_TTL_SECONDS", "600"))
@@ -59,7 +57,6 @@ ANNOUNCEMENT_RE = re.compile(
 
 _config: dict = {}
 
-
 def load_config():
     global _config
     if os.path.exists(CONFIG_FILE):
@@ -68,16 +65,13 @@ def load_config():
     else:
         _config = {}
 
-
 def save_config():
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(_config, f)
 
-
 def get_notify_chat_id():
     val = _config.get("notify_chat_id")
     return int(val) if val is not None else None
-
 
 def get_alpha_config():
     chat_id = _config.get("alpha_chat_id")
@@ -91,19 +85,15 @@ def get_alpha_config():
 
 thread_buffers = defaultdict(lambda: deque(maxlen=BUFFER_LIMIT))
 
-
 def message_text(message) -> str:
     return (message.text or message.caption or "").strip()
-
 
 def thread_key(message):
     return message.chat_id, message.message_thread_id
 
-
 def prune_buffer(buf, now: float):
     while buf and now - buf[0]["ts"] > BUFFER_TTL_SECONDS:
         buf.popleft()
-
 
 def add_to_buffer(message, text: str, deleted: bool):
     user = message.from_user
@@ -124,13 +114,11 @@ def add_to_buffer(message, text: str, deleted: bool):
         }
     )
 
-
 def get_context_before(message):
     now = time.time()
     buf = thread_buffers[thread_key(message)]
     prune_buffer(buf, now)
     return list(buf)
-
 
 def user_aliases(context_items, current_user_id, reply_user_id=None):
     aliases = {}
@@ -149,7 +137,6 @@ def user_aliases(context_items, current_user_id, reply_user_id=None):
     alias(reply_user_id)
     return alias
 
-
 def format_context(context_items, current_user_id, reply_user_id=None):
     alias = user_aliases(context_items, current_user_id, reply_user_id)
     lines = []
@@ -158,7 +145,6 @@ def format_context(context_items, current_user_id, reply_user_id=None):
         reply_tag = " reply" if item["is_reply"] else ""
         lines.append(f"- {alias(item['user_id'])}{reply_tag} ({state}): {item['text']}")
     return "\n".join(lines) if lines else "- No recent context."
-
 
 def parse_gemini_json(answer: str) -> dict:
     answer = answer.strip()
@@ -174,13 +160,12 @@ def parse_gemini_json(answer: str) -> dict:
             return {}
 
 
-# --- Gemini moderation ---
+# --- Grok moderation (xAI) ---
 
 def has_strong_alpha_signal(text: str) -> bool:
     return bool(STRONG_ALPHA_RE.search(text) or ANNOUNCEMENT_RE.search(text))
 
-
-def gemini_should_delete(
+def grok_should_delete(
     text: str,
     context_items,
     reply_text: str | None,
@@ -210,38 +195,38 @@ def gemini_should_delete(
         "- a short follow-up that changes a trade decision, such as 'wait for pullback', 'entry here', 'dev sold', 'volume coming in', 'not buying yet'\n"
         "- anything ambiguous. When unsure, KEEP.\n\n"
         "Return only JSON with this shape:\n"
-        "{\"action\":\"DELETE\" or \"KEEP\", \"confidence\":0.0-1.0, \"reason\":\"short reason\"}\n\n"
+        "{\"action\": \"DELETE\" or \"KEEP\", \"confidence\": 0.0-1.0, \"reason\": \"short reason\"}\n\n"
         f"RECENT_CONTEXT:\n{format_context(context_items, current_user_id, reply_user_id)}\n\n"
         f"REPLY_TARGET:\n{reply_section}\n\n"
         f"CURRENT_MESSAGE:\nCURRENT_USER: {text[:1600]}"
     )
 
-    body = json.dumps(
-        {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "maxOutputTokens": 120,
-                "temperature": 0,
-                "responseMimeType": "application/json",
-            },
-        }
-    ).encode("utf-8")
+    body = json.dumps({
+        "model": GROK_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+        "max_tokens": 120,
+        "response_format": {"type": "json_object"}
+    }).encode("utf-8")
 
     req = urllib.request.Request(
-        GEMINI_URL,
+        GROK_URL,
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {GROK_API_KEY}",
+        },
         method="POST",
     )
 
     try:
         with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT_SECONDS) as resp:
             data = json.loads(resp.read())
-            answer = data["candidates"][0]["content"]["parts"][0]["text"]
+            answer = data["choices"][0]["message"]["content"]
             verdict = parse_gemini_json(answer)
     except Exception as e:
-        logger.error(f"Gemini API error: {e}")
-        return False, "gemini error"
+        logger.error(f"Grok API error: {e}")
+        return False, "grok error"
 
     action = str(verdict.get("action", "")).upper()
     try:
@@ -250,7 +235,7 @@ def gemini_should_delete(
         confidence = 0
     reason = str(verdict.get("reason", "no reason"))
 
-    logger.info(f"Gemini verdict={action} confidence={confidence:.2f} reason={reason} text={text[:80]}")
+    logger.info(f"Grok verdict={action} confidence={confidence:.2f} reason={reason} text={text[:80]}")
     should_delete = action == "DELETE" and confidence >= DELETE_CONFIDENCE_THRESHOLD
     return should_delete, reason
 
@@ -266,7 +251,7 @@ async def should_delete_message(message, text: str, context_items) -> tuple[bool
             reply_user_id = message.reply_to_message.from_user.id
 
     return await asyncio.to_thread(
-        gemini_should_delete,
+        grok_should_delete,
         text,
         context_items,
         reply_text,
@@ -399,7 +384,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     add_to_buffer(message, text, deleted=False)
-
 
 def main():
     load_config()
