@@ -19,11 +19,13 @@ logger = logging.getLogger(__name__)
 
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-# === GROK API (xAI) ===
-GROK_API_KEY = os.environ["GROK_API_KEY"]
-GROK_URL = "https://api.x.ai/v1/chat/completions"
-GROK_MODEL = "grok-3"  # or "grok-3-mini" — check your console.x.ai for the latest available model
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 CONFIG_FILE = "config.json"
+
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-2.5-flash-lite:generateContent?key=" + GEMINI_API_KEY
+)
 
 BUFFER_LIMIT = int(os.getenv("BUFFER_LIMIT", "12"))
 BUFFER_TTL_SECONDS = int(os.getenv("BUFFER_TTL_SECONDS", "600"))
@@ -160,12 +162,11 @@ def parse_gemini_json(answer: str) -> dict:
             return {}
 
 
-# --- Grok moderation (xAI) ---
-
+# --- Gemini moderation ---
 def has_strong_alpha_signal(text: str) -> bool:
     return bool(STRONG_ALPHA_RE.search(text) or ANNOUNCEMENT_RE.search(text))
 
-def grok_should_delete(
+def gemini_should_delete(
     text: str,
     context_items,
     reply_text: str | None,
@@ -195,38 +196,38 @@ def grok_should_delete(
         "- a short follow-up that changes a trade decision, such as 'wait for pullback', 'entry here', 'dev sold', 'volume coming in', 'not buying yet'\n"
         "- anything ambiguous. When unsure, KEEP.\n\n"
         "Return only JSON with this shape:\n"
-        "{\"action\": \"DELETE\" or \"KEEP\", \"confidence\": 0.0-1.0, \"reason\": \"short reason\"}\n\n"
+        "{\"action\":\"DELETE\" or \"KEEP\", \"confidence\":0.0-1.0, \"reason\":\"short reason\"}\n\n"
         f"RECENT_CONTEXT:\n{format_context(context_items, current_user_id, reply_user_id)}\n\n"
         f"REPLY_TARGET:\n{reply_section}\n\n"
         f"CURRENT_MESSAGE:\nCURRENT_USER: {text[:1600]}"
     )
 
-    body = json.dumps({
-        "model": GROK_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
-        "max_tokens": 120,
-        "response_format": {"type": "json_object"}
-    }).encode("utf-8")
+    body = json.dumps(
+        {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "maxOutputTokens": 120,
+                "temperature": 0,
+                "responseMimeType": "application/json",
+            },
+        }
+    ).encode("utf-8")
 
     req = urllib.request.Request(
-        GROK_URL,
+        GEMINI_URL,
         data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {GROK_API_KEY}",
-        },
+        headers={"Content-Type": "application/json"},
         method="POST",
     )
 
     try:
         with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT_SECONDS) as resp:
             data = json.loads(resp.read())
-            answer = data["choices"][0]["message"]["content"]
+            answer = data["candidates"][0]["content"]["parts"][0]["text"]
             verdict = parse_gemini_json(answer)
     except Exception as e:
-        logger.error(f"Grok API error: {e}")
-        return False, "grok error"
+        logger.error(f"Gemini API error: {e}")
+        return False, "gemini error"
 
     action = str(verdict.get("action", "")).upper()
     try:
@@ -235,7 +236,7 @@ def grok_should_delete(
         confidence = 0
     reason = str(verdict.get("reason", "no reason"))
 
-    logger.info(f"Grok verdict={action} confidence={confidence:.2f} reason={reason} text={text[:80]}")
+    logger.info(f"Gemini verdict={action} confidence={confidence:.2f} reason={reason} text={text[:80]}")
     should_delete = action == "DELETE" and confidence >= DELETE_CONFIDENCE_THRESHOLD
     return should_delete, reason
 
@@ -251,7 +252,7 @@ async def should_delete_message(message, text: str, context_items) -> tuple[bool
             reply_user_id = message.reply_to_message.from_user.id
 
     return await asyncio.to_thread(
-        grok_should_delete,
+        gemini_should_delete,
         text,
         context_items,
         reply_text,
