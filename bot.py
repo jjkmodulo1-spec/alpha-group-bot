@@ -38,7 +38,7 @@ BUFFER_TTL_SECONDS = int(os.getenv("BUFFER_TTL_SECONDS", "600"))
 DELETE_CONFIDENCE_THRESHOLD = float(os.getenv("DELETE_CONFIDENCE_THRESHOLD", "0.82"))
 GEMINI_TIMEOUT_SECONDS = int(os.getenv("GEMINI_TIMEOUT_SECONDS", "8"))
 TOKEN_DETAILS_ENABLED = env_flag("TOKEN_DETAILS_ENABLED", "1")
-TOKEN_CHAIN_ID = os.getenv("TOKEN_CHAIN_ID", "base").strip().lower()
+TOKEN_CHAIN_ID = os.getenv("TOKEN_CHAIN_ID", "").strip().lower()
 TOKEN_LOOKUP_TIMEOUT_SECONDS = int(os.getenv("TOKEN_LOOKUP_TIMEOUT_SECONDS", "6"))
 TOKEN_ORDER_TIMEOUT_SECONDS = int(os.getenv("TOKEN_ORDER_TIMEOUT_SECONDS", "3"))
 TOKEN_REPLY_CACHE_SECONDS = int(os.getenv("TOKEN_REPLY_CACHE_SECONDS", "1800"))
@@ -48,12 +48,16 @@ TOKEN_TICKER_BLOCKLIST = {
     item.strip().upper()
     for item in os.getenv(
         "TOKEN_TICKER_BLOCKLIST",
-        "BTC,ETH,SOL,USDC,USDT,USD,WETH,WBTC,BNB,BASE",
+        "",
     ).split(",")
     if item.strip()
 }
 
-STRONG_ALPHA_RE = re.compile(
+MORALIS_API_KEY = os.getenv("MORALIS_API_KEY", "").strip()
+PRICE_ALERT_INTERVAL_SECONDS = int(os.getenv("PRICE_ALERT_INTERVAL_SECONDS", "60"))
+HONEYPOT_TIMEOUT_SECONDS = int(os.getenv("HONEYPOT_TIMEOUT_SECONDS", "5"))
+TRENDING_CHAIN = os.getenv("TRENDING_CHAIN", "").strip().lower()
+
     r"("
     r"0x[a-fA-F0-9]{40}"
     r"|https?://\S+"
@@ -66,7 +70,27 @@ STRONG_ALPHA_RE = re.compile(
     re.IGNORECASE,
 )
 
-TICKER_DROP_RE = re.compile(r"(?<![\w/])\$([A-Za-z][A-Za-z0-9_]{1,12})\b")
+TICKER_DROP_RE = re.compile(r"(?<![\w/])\$?([A-Za-z][A-Za-z0-9_]{1,12})\b")
+
+# Common English words to ignore when matching plain (non-$) tickers
+PLAIN_TICKER_STOPWORDS = {
+    "the", "and", "for", "are", "but", "not", "you", "all", "can", "her",
+    "was", "one", "our", "out", "day", "get", "has", "him", "his", "how",
+    "its", "new", "now", "old", "see", "two", "who", "boy", "did", "she",
+    "use", "way", "may", "say", "any", "let", "put", "too", "got", "big",
+    "own", "run", "off", "set", "end", "why", "ask", "men", "buy", "gm",
+    "gg", "gn", "lol", "lfg", "ok", "yes", "no", "up", "down", "good",
+    "bad", "nice", "wow", "hey", "hi", "bye", "bro", "just", "this",
+    "that", "with", "from", "they", "have", "will", "been", "more", "into",
+    "also", "only", "some", "than", "then", "like", "here", "when", "what",
+    "your", "time", "very", "well", "back", "been", "make", "each", "much",
+    "even", "most", "over", "such", "long", "come", "work", "life", "high",
+    "both", "next", "many", "last", "take", "same", "give", "after", "team",
+    "keep", "move", "play", "need", "call", "feel", "real", "look", "hold",
+    "wait", "tell", "pump", "dump", "send", "chat", "news", "week", "hour",
+    "market", "price", "token", "chart", "trade", "base", "chain", "wallet",
+    "check", "think", "know", "going", "right", "still", "might", "every",
+}
 EVM_ADDRESS_RE = re.compile(r"\b0x[a-fA-F0-9]{40}\b")
 
 ANNOUNCEMENT_RE = re.compile(
@@ -297,6 +321,10 @@ def extract_token_queries(text: str) -> list[dict]:
         symbol = match.group(1).upper()
         if symbol in TOKEN_TICKER_BLOCKLIST:
             continue
+        # If no $ prefix, skip common words to avoid false positives
+        has_dollar = match.group(0).startswith("$")
+        if not has_dollar and symbol.lower() in PLAIN_TICKER_STOPWORDS:
+            continue
         key = ("ticker", symbol)
         if key not in seen:
             queries.append({"type": "ticker", "value": symbol})
@@ -358,6 +386,8 @@ def pair_score(pair: dict) -> tuple[float, float, int, float]:
 
 
 def is_target_chain(pair: dict) -> bool:
+    if not TOKEN_CHAIN_ID:
+        return True
     return str(pair.get("chainId", "")).lower() == TOKEN_CHAIN_ID
 
 
@@ -390,9 +420,19 @@ def pick_best_pair(pairs: list[dict], query: dict) -> dict | None:
 def lookup_pairs(query: dict) -> list[dict]:
     if query["type"] == "address":
         address = urllib.parse.quote(query["value"], safe="")
-        url = f"https://api.dexscreener.com/token-pairs/v1/{TOKEN_CHAIN_ID}/{address}"
+        chain = TOKEN_CHAIN_ID or "ethereum"
+        url = f"https://api.dexscreener.com/token-pairs/v1/{chain}/{address}"
+        try:
+            data = fetch_json_url(url)
+            pairs = data if isinstance(data, list) else data.get("pairs", [])
+            if pairs:
+                return pairs
+        except Exception:
+            pass
+        # Fallback: search by address across all chains
+        url = f"https://api.dexscreener.com/latest/dex/search?q={address}"
         data = fetch_json_url(url)
-        return data if isinstance(data, list) else data.get("pairs", [])
+        return data.get("pairs", []) if isinstance(data, dict) else []
 
     symbol = urllib.parse.quote(query["value"], safe="")
     url = f"https://api.dexscreener.com/latest/dex/search?q={symbol}"
@@ -410,12 +450,13 @@ def token_for_query(pair: dict, query: dict) -> dict:
     return base_token
 
 
-def fetch_dex_orders(token_address: str) -> dict:
+def fetch_dex_orders(token_address: str, chain_id: str | None = None) -> dict:
     if not token_address:
         return {"paid": None, "ads": None, "cto": None}
 
+    chain = chain_id or TOKEN_CHAIN_ID or "ethereum"
     address = urllib.parse.quote(token_address, safe="")
-    url = f"https://api.dexscreener.com/orders/v1/{TOKEN_CHAIN_ID}/{address}"
+    url = f"https://api.dexscreener.com/orders/v1/{chain}/{address}"
     try:
         data = fetch_json_url(url, timeout=TOKEN_ORDER_TIMEOUT_SECONDS)
     except Exception as e:
@@ -494,12 +535,13 @@ def collect_social_links(pair: dict) -> list[str]:
     return links[:6]
 
 
-def format_token_details(pair: dict, token: dict, orders: dict) -> str:
+def format_token_details(pair: dict, token: dict, orders: dict, *, honeypot: dict | None = None, holders: list | None = None) -> str:
     symbol = str(token.get("symbol") or "?").upper()
     name = str(token.get("name") or symbol)
     token_address = str(token.get("address") or "")
     quote_token = pair.get("quoteToken") or {}
     quote_symbol = str(quote_token.get("symbol") or "")
+    chain_id = str(pair.get("chainId") or TOKEN_CHAIN_ID or "").lower()
 
     liquidity = pair.get("liquidity") or {}
     volume = pair.get("volume") or {}
@@ -544,42 +586,122 @@ def format_token_details(pair: dict, token: dict, orders: dict) -> str:
     cto = " • 🤝 CTO" if orders.get("cto") else ""
     active_boosts = int(boosts.get("active") or 0)
 
-    chart_url = pair.get("url") or f"https://dexscreener.com/{TOKEN_CHAIN_ID}/{pair.get('pairAddress', '')}"
-    basescan_url = f"https://basescan.org/token/{token_address}" if token_address else None
-    swap_url = f"https://app.uniswap.org/swap?chain={TOKEN_CHAIN_ID}&outputCurrency={urllib.parse.quote(token_address, safe='')}" if token_address else None
+    EXPLORER_MAP = {
+        "base": ("BaseScan", "https://basescan.org/token/"),
+        "ethereum": ("Etherscan", "https://etherscan.io/token/"),
+        "bsc": ("BscScan", "https://bscscan.com/token/"),
+        "solana": ("Solscan", "https://solscan.io/token/"),
+        "arbitrum": ("Arbiscan", "https://arbiscan.io/token/"),
+        "polygon": ("Polygonscan", "https://polygonscan.com/token/"),
+        "avalanche": ("Snowtrace", "https://snowtrace.io/token/"),
+        "optimism": ("Optimism", "https://optimistic.etherscan.io/token/"),
+    }
+    explorer_label, explorer_base = EXPLORER_MAP.get(chain_id, ("Explorer", f"https://dexscreener.com/{chain_id}/"))
+    chain_display = chain_id.capitalize() if chain_id else "Unknown"
+
+    chart_url = pair.get("url") or f"https://dexscreener.com/{chain_id}/{pair.get('pairAddress', '')}"
+    basescan_url = f"{explorer_base}{token_address}" if token_address else None
+    if chain_id == "solana":
+        swap_url = f"https://jup.ag/swap/SOL-{urllib.parse.quote(token_address, safe='')}" if token_address else None
+    else:
+        swap_url = f"https://app.uniswap.org/swap?chain={chain_id}&outputCurrency={urllib.parse.quote(token_address, safe='')}" if token_address else None
+    bubble_url = f"https://app.bubblemaps.io/{chain_id}/token/{token_address}" if token_address and chain_id else None
     link_parts = [
         html_link("Chart", chart_url),
-        html_link("BaseScan", basescan_url),
+        html_link(explorer_label, basescan_url),
         html_link("Swap", swap_url),
+        html_link("Bubblemap", bubble_url),
     ]
     link_line = " | ".join(part for part in link_parts if part)
 
     social_parts = collect_social_links(pair)
     social_line = " | ".join(social_parts) if social_parts else "None found"
 
+    # Price change arrows
+    def change_arrow(pct):
+        if pct is None:
+            return ""
+        return "▲" if pct >= 0 else "▼"
+
+    h1_arrow = change_arrow(h1_change)
+    h24_arrow = change_arrow(h24_change)
+    h1_str = f"{h1_arrow} {format_percent(h1_change)}" if h1_change is not None else "—"
+    h24_str = f"{h24_arrow} {format_percent(h24_change)}" if h24_change is not None else "—"
+
+    # Boost badge
+    boost_badge = f" ⚡×{active_boosts}" if active_boosts else ""
+
+    # CTO badge
+    cto_badge = "  🤝 CTO" if orders.get("cto") else ""
+
+    # Dex status
+    dex_status_parts = []
+    if orders.get("paid") is True:
+        dex_status_parts.append("✅ Paid")
+    elif orders.get("paid") is False:
+        dex_status_parts.append("❌ Unpaid")
+    if orders.get("ads") is True:
+        dex_status_parts.append("📢 Ads")
+    dex_status = "  •  ".join(dex_status_parts) if dex_status_parts else "—"
+
+    # Txn bar (1h)
+    txn_bar = ""
+    if txn_total:
+        bar_width = 10
+        buy_blocks = round((buys / txn_total) * bar_width) if txn_total else 0
+        sell_blocks = bar_width - buy_blocks
+        txn_bar = "🟢" * buy_blocks + "🔴" * sell_blocks
+        txn_bar = f"{txn_bar}  {buys}B / {sells}S  ({txn_total} txns)"
+
+    separator = "┄" * 18
+
     lines = [
-        f"💊 {html.escape(name)} • ${html.escape(symbol)}",
-        f"🕒 Age:  {format_age(pair.get('pairCreatedAt'))} [{change_label}] • 🧬 Base{cto}",
-        f"💵 Price: {format_price(pair.get('priceUsd'))}",
-        f"💰 MC:   {format_usd(cap_value)}{fdv_part}",
-        f"💧 Liq:  {format_usd(safe_float(liquidity.get('usd')))}{quote_liq_part}",
-        volume_line,
+        # Header
+        f"<b>{html.escape(name)}</b>  <code>${html.escape(symbol)}</code>",
+        f"🔗 {chain_display}{cto_badge}{boost_badge}",
+        "",
+        # Price block
+        f"💵 <b>{format_price(pair.get('priceUsd'))}</b>",
+        f"   1h  {h1_str}    24h  {h24_str}",
+        "",
+        # Market stats
+        separator,
+        f"💰 MC        {format_usd(cap_value)}{fdv_part}",
+        f"💧 Liquidity  {format_usd(safe_float(liquidity.get('usd')))}{quote_liq_part}",
+        f"📊 Vol 1h    {format_usd(h1_volume)}",
+        f"📊 Vol 24h   {format_usd(h24_volume)}",
     ]
 
-    if txn_total:
-        lines.append(f"⚡ Txns: {txn_total} [1h] • 🟢 {buys} / 🔴 {sells}")
-
-    lines.extend(
-        [
-            f"🦅 Dex: Paid{dex_paid} Ads{ads_paid} {active_boosts}⚡",
-            "",
-            f"<code>{html.escape(token_address)}</code>",
+    if txn_bar:
+        lines += [
+            f"⚡ Txns 1h   {txn_bar}",
         ]
-    )
+
+    lines += [
+        f"🕰 Age       {format_age(pair.get('pairCreatedAt'))}",
+        separator,
+        "",
+        # DEX info
+        f"🦅 DexScreener  {dex_status}",
+        "",
+        # Contract
+        f"📋 <code>{html.escape(token_address)}</code>",
+        "",
+        # Links
+    ]
 
     if link_line:
-        lines.append(f"📊 {link_line}")
-    lines.append(f"👻 Socials: {social_line}")
+        lines.append(f"🔍 {link_line}")
+
+    if social_parts:
+        lines.append(f"🌐 {social_line}")
+
+    # Honeypot check
+    lines += ["", format_honeypot(honeypot)]
+
+    # Top holders (only if available)
+    if holders:
+        lines += ["", format_top_holders(holders, symbol)]
 
     return "\n".join(lines)
 
@@ -596,10 +718,14 @@ def build_token_detail_reply(query: dict) -> dict | None:
         if not token_address:
             return None
 
-        orders = fetch_dex_orders(token_address)
+        chain_id = str(pair.get("chainId") or TOKEN_CHAIN_ID or "ethereum")
+        orders = fetch_dex_orders(token_address, chain_id=chain_id)
+        honeypot = fetch_honeypot(token_address, chain_id)
+        holders = fetch_top_holders(token_address, chain_id)
+
         return {
             "token_address": token_address,
-            "text": format_token_details(pair, token, orders),
+            "text": format_token_details(pair, token, orders, honeypot=honeypot, holders=holders),
         }
     except Exception as e:
         logger.error(f"Token detail lookup failed for {query}: {e}")
@@ -869,14 +995,469 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     add_to_buffer(message, text, deleted=False)
     await maybe_reply_token_details(message, text)
 
+# ─────────────────────────────────────────────
+# --- Honeypot check ---
+# ─────────────────────────────────────────────
+
+def fetch_honeypot(token_address: str, chain_id: str) -> dict | None:
+    """Check token via honeypot.is API. Returns result dict or None on failure."""
+    CHAIN_MAP = {
+        "ethereum": "1", "bsc": "56", "base": "8453",
+        "arbitrum": "42161", "polygon": "137", "avalanche": "43114",
+        "optimism": "10",
+    }
+    chain_num = CHAIN_MAP.get(chain_id.lower())
+    if not chain_num:
+        return None
+    try:
+        url = f"https://api.honeypot.is/v2/IsHoneypot?address={urllib.parse.quote(token_address, safe='')}&chainID={chain_num}"
+        return fetch_json_url(url, timeout=HONEYPOT_TIMEOUT_SECONDS)
+    except Exception as e:
+        logger.info(f"Honeypot check failed for {token_address}: {e}")
+        return None
+
+
+def format_honeypot(data: dict) -> str:
+    """Format honeypot.is result into a short summary line."""
+    if data is None:
+        return "⚠️ Honeypot check unavailable"
+
+    hp = data.get("honeypotResult") or {}
+    sim = data.get("simulationResult") or {}
+    token = data.get("token") or {}
+    flags = data.get("flags") or []
+
+    is_hp = hp.get("isHoneypot", False)
+    buy_tax = safe_float(sim.get("buyTax"))
+    sell_tax = safe_float(sim.get("sellTax"))
+
+    if is_hp:
+        reason = hp.get("honeypotReason") or "unknown reason"
+        result = f"🚨 <b>HONEYPOT</b> — {html.escape(reason)}"
+    else:
+        taxes = []
+        if buy_tax is not None:
+            taxes.append(f"Buy {buy_tax:.1f}%")
+        if sell_tax is not None:
+            taxes.append(f"Sell {sell_tax:.1f}%")
+        tax_str = "  •  ".join(taxes) if taxes else "Tax n/a"
+        result = f"✅ Not honeypot  •  {tax_str}"
+
+    flag_str = ""
+    if flags:
+        flag_str = "  ⚠️ " + ", ".join(str(f) for f in flags[:3])
+
+    return result + flag_str
+
+
+# ─────────────────────────────────────────────
+# --- Top holders ---
+# ─────────────────────────────────────────────
+
+def fetch_top_holders(token_address: str, chain_id: str) -> list[dict] | None:
+    """Fetch top token holders via Moralis API."""
+    if not MORALIS_API_KEY:
+        return None
+
+    MORALIS_CHAIN_MAP = {
+        "ethereum": "eth", "bsc": "bsc", "base": "base",
+        "arbitrum": "arbitrum", "polygon": "polygon",
+        "avalanche": "avalanche", "optimism": "optimism",
+    }
+    chain = MORALIS_CHAIN_MAP.get(chain_id.lower())
+    if not chain:
+        return None
+
+    try:
+        url = (
+            f"https://deep-index.moralis.io/api/v2.2/erc20/{urllib.parse.quote(token_address, safe='')}"
+            f"/owners?chain={chain}&limit=10&order=DESC"
+        )
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/json",
+                "X-API-Key": MORALIS_API_KEY,
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=TOKEN_LOOKUP_TIMEOUT_SECONDS) as resp:
+            data = json.loads(resp.read())
+            return data.get("result") or []
+    except Exception as e:
+        logger.info(f"Top holders fetch failed for {token_address}: {e}")
+        return None
+
+
+def format_top_holders(holders: list[dict] | None, token_symbol: str) -> str:
+    """Format top holders list into a readable block."""
+    if not holders:
+        if not MORALIS_API_KEY:
+            return "🔑 Set MORALIS_API_KEY to enable holder data"
+        return "📭 Holder data unavailable"
+
+    lines = [f"🐳 <b>Top Holders  •  ${html.escape(token_symbol)}</b>", ""]
+    top10_pct = 0.0
+    for i, h in enumerate(holders[:10], 1):
+        address = str(h.get("owner_address") or "")
+        pct = safe_float(h.get("percentage_relative_to_total_supply")) or 0.0
+        top10_pct += pct
+        short = f"{address[:6]}…{address[-4:]}" if len(address) > 10 else address
+        bar = "█" * min(int(pct / 2), 20)
+        lines.append(f"<code>{i:>2}. {short}</code>  {pct:.2f}%  {bar}")
+
+    lines += ["", f"📊 Top 10 hold  <b>{top10_pct:.1f}%</b>"]
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────
+# --- Price alerts ---
+# ─────────────────────────────────────────────
+
+# alert structure: {alert_id: {user_id, chat_id, thread_id, token_address, chain_id, symbol, target_price, direction, set_at}}
+price_alerts: dict[str, dict] = {}
+_alert_counter = 0
+
+def next_alert_id() -> str:
+    global _alert_counter
+    _alert_counter += 1
+    return str(_alert_counter)
+
+
+def save_alerts():
+    _config["price_alerts"] = price_alerts
+    save_config()
+
+
+def load_alerts():
+    global price_alerts
+    price_alerts = _config.get("price_alerts", {})
+
+
+def fetch_current_price(token_address: str, chain_id: str) -> float | None:
+    """Fetch current price for a token from DexScreener."""
+    try:
+        chain = chain_id or "ethereum"
+        address = urllib.parse.quote(token_address, safe="")
+        url = f"https://api.dexscreener.com/token-pairs/v1/{chain}/{address}"
+        data = fetch_json_url(url, timeout=TOKEN_LOOKUP_TIMEOUT_SECONDS)
+        pairs = data if isinstance(data, list) else data.get("pairs", [])
+        if not pairs:
+            return None
+        best = max(pairs, key=pair_score)
+        return safe_float(best.get("priceUsd"))
+    except Exception:
+        return None
+
+
+async def check_price_alerts(context: ContextTypes.DEFAULT_TYPE):
+    """Background job: check all active price alerts and fire if hit."""
+    if not price_alerts:
+        return
+
+    fired = []
+    for alert_id, alert in list(price_alerts.items()):
+        try:
+            price = await asyncio.to_thread(
+                fetch_current_price, alert["token_address"], alert["chain_id"]
+            )
+            if price is None:
+                continue
+
+            target = alert["target_price"]
+            hit = (alert["direction"] == "above" and price >= target) or \
+                  (alert["direction"] == "below" and price <= target)
+
+            if hit:
+                fired.append((alert_id, alert, price))
+        except Exception as e:
+            logger.error(f"Alert check failed for {alert_id}: {e}")
+
+    for alert_id, alert, price in fired:
+        try:
+            direction_icon = "🟢" if alert["direction"] == "above" else "🔴"
+            mention = f'<a href="tg://user?id={alert["user_id"]}">user</a>'
+            text = (
+                f"🔔 <b>Price Alert Hit!</b>\n\n"
+                f"{direction_icon} <b>${html.escape(alert['symbol'])}</b> is now <b>{format_price(price)}</b>\n"
+                f"Target was {format_price(alert['target_price'])} ({alert['direction']})\n\n"
+                f"Set by {mention}"
+            )
+            await context.bot.send_message(
+                chat_id=alert["chat_id"],
+                message_thread_id=alert.get("thread_id"),
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            del price_alerts[alert_id]
+            save_alerts()
+            logger.info(f"Alert {alert_id} fired for ${alert['symbol']} at {price}")
+        except Exception as e:
+            logger.error(f"Alert notification failed for {alert_id}: {e}")
+
+
+async def cmd_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Usage:
+      /alert <CA or $TICKER> <above|below> <price>
+      /alert list
+      /alert cancel <id>
+    """
+    args = context.args or []
+
+    if not args:
+        await update.message.reply_text(
+            "Usage:\n"
+            "  /alert &lt;CA or $TICKER&gt; &lt;above|below&gt; &lt;price&gt;\n"
+            "  /alert list\n"
+            "  /alert cancel &lt;id&gt;",
+            parse_mode="HTML",
+        )
+        return
+
+    user_id = update.effective_user.id
+
+    # List alerts
+    if args[0].lower() == "list":
+        user_alerts = [(aid, a) for aid, a in price_alerts.items() if a["user_id"] == user_id]
+        if not user_alerts:
+            await update.message.reply_text("You have no active alerts.")
+            return
+        lines = ["<b>Your Active Alerts</b>\n"]
+        for aid, a in user_alerts:
+            lines.append(
+                f"#{aid}  ${html.escape(a['symbol'])}  {a['direction']} {format_price(a['target_price'])}"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        return
+
+    # Cancel alert
+    if args[0].lower() == "cancel":
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /alert cancel <id>")
+            return
+        aid = args[1]
+        alert = price_alerts.get(aid)
+        if not alert or alert["user_id"] != user_id:
+            await update.message.reply_text("Alert not found.")
+            return
+        del price_alerts[aid]
+        save_alerts()
+        await update.message.reply_text(f"✅ Alert #{aid} cancelled.")
+        return
+
+    # Set new alert: /alert <token> <above|below> <price>
+    if len(args) < 3:
+        await update.message.reply_text(
+            "Usage: /alert &lt;CA or $TICKER&gt; &lt;above|below&gt; &lt;price&gt;",
+            parse_mode="HTML",
+        )
+        return
+
+    token_input = args[0].lstrip("$")
+    direction = args[1].lower()
+    if direction not in ("above", "below"):
+        await update.message.reply_text("Direction must be 'above' or 'below'.")
+        return
+
+    target_price = safe_float(args[2])
+    if target_price is None or target_price <= 0:
+        await update.message.reply_text("Invalid price.")
+        return
+
+    # Look up token
+    await update.message.reply_text("🔍 Looking up token...")
+    if EVM_ADDRESS_RE.match(token_input):
+        query = {"type": "address", "value": token_input}
+    else:
+        query = {"type": "ticker", "value": token_input.upper()}
+
+    result = await asyncio.to_thread(build_token_detail_reply, query)
+    if not result:
+        await update.message.reply_text("❌ Token not found. Try using the contract address.")
+        return
+
+    # Grab symbol and chain from the pair
+    pairs = await asyncio.to_thread(lookup_pairs, query)
+    pair = pick_best_pair(pairs, query)
+    if not pair:
+        await update.message.reply_text("❌ Could not resolve token pair.")
+        return
+
+    token = token_for_query(pair, query)
+    symbol = str(token.get("symbol") or token_input).upper()
+    chain_id = str(pair.get("chainId") or TOKEN_CHAIN_ID or "ethereum")
+    current_price = safe_float(pair.get("priceUsd"))
+
+    alert_id = next_alert_id()
+    price_alerts[alert_id] = {
+        "user_id": user_id,
+        "chat_id": update.effective_chat.id,
+        "thread_id": update.message.message_thread_id,
+        "token_address": result["token_address"],
+        "chain_id": chain_id,
+        "symbol": symbol,
+        "target_price": target_price,
+        "direction": direction,
+        "set_at": time.time(),
+    }
+    save_alerts()
+
+    current_str = f"  (now {format_price(current_price)})" if current_price else ""
+    await update.message.reply_text(
+        f"🔔 Alert #{alert_id} set!\n"
+        f"${html.escape(symbol)} {direction} {format_price(target_price)}{html.escape(current_str)}\n"
+        f"I'll notify you here when it's hit.",
+        parse_mode="HTML",
+    )
+
+
+# ─────────────────────────────────────────────
+# --- /pnl command ---
+# ─────────────────────────────────────────────
+
+async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Usage: /pnl <CA or $TICKER> <entry_price> [amount]
+    Example: /pnl $PEPE 0.000001 500000
+    """
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: /pnl &lt;CA or $TICKER&gt; &lt;entry_price&gt; [amount]\n"
+            "Example: /pnl $PEPE 0.000001 500000",
+            parse_mode="HTML",
+        )
+        return
+
+    token_input = args[0].lstrip("$")
+    entry_price = safe_float(args[1])
+    amount = safe_float(args[2]) if len(args) >= 3 else None
+
+    if entry_price is None or entry_price <= 0:
+        await update.message.reply_text("❌ Invalid entry price.")
+        return
+
+    await update.message.reply_text("🔍 Fetching current price...")
+
+    if EVM_ADDRESS_RE.match(token_input):
+        query = {"type": "address", "value": token_input}
+    else:
+        query = {"type": "ticker", "value": token_input.upper()}
+
+    pairs = await asyncio.to_thread(lookup_pairs, query)
+    pair = pick_best_pair(pairs, query)
+    if not pair:
+        await update.message.reply_text("❌ Token not found.")
+        return
+
+    token = token_for_query(pair, query)
+    symbol = str(token.get("symbol") or token_input).upper()
+    current_price = safe_float(pair.get("priceUsd"))
+    if current_price is None:
+        await update.message.reply_text("❌ Could not fetch current price.")
+        return
+
+    pnl_pct = ((current_price - entry_price) / entry_price) * 100
+    multiplier = current_price / entry_price
+
+    lines = [
+        f"📈 <b>PnL  •  ${html.escape(symbol)}</b>",
+        "",
+        f"Entry    {format_price(entry_price)}",
+        f"Now      {format_price(current_price)}",
+        f"Change   {'▲' if pnl_pct >= 0 else '▼'} {format_percent(pnl_pct)}  ({multiplier:.2f}x)",
+    ]
+
+    if amount is not None:
+        value_now = amount * current_price
+        value_entry = amount * entry_price
+        pnl_usd = value_now - value_entry
+        sign = "+" if pnl_usd >= 0 else ""
+        lines += [
+            "",
+            f"Tokens   {format_compact_number(amount)}",
+            f"Worth    {format_usd(value_now)}",
+            f"PnL      {sign}{format_usd(pnl_usd)}",
+        ]
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+# ─────────────────────────────────────────────
+# --- /trending command ---
+# ─────────────────────────────────────────────
+
+def fetch_trending_pairs() -> list[dict]:
+    """Fetch trending tokens from DexScreener."""
+    url = "https://api.dexscreener.com/token-boosts/top/v1"
+    try:
+        data = fetch_json_url(url, timeout=TOKEN_LOOKUP_TIMEOUT_SECONDS)
+        pairs = data if isinstance(data, list) else []
+        if TRENDING_CHAIN or TOKEN_CHAIN_ID:
+            chain = TRENDING_CHAIN or TOKEN_CHAIN_ID
+            pairs = [p for p in pairs if str(p.get("chainId", "")).lower() == chain]
+        return pairs[:10]
+    except Exception as e:
+        logger.error(f"Trending fetch failed: {e}")
+        return []
+
+
+async def cmd_trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show trending tokens from DexScreener."""
+    await update.message.reply_text("🔥 Fetching trending tokens...")
+
+    pairs = await asyncio.to_thread(fetch_trending_pairs)
+    if not pairs:
+        await update.message.reply_text("❌ Could not fetch trending tokens right now.")
+        return
+
+    lines = ["🔥 <b>Trending on DexScreener</b>\n"]
+    for i, p in enumerate(pairs, 1):
+        token = p.get("baseToken") or p.get("token") or {}
+        symbol = str(token.get("symbol") or p.get("tokenAddress", "")[:8]).upper()
+        name = str(token.get("name") or symbol)
+        chain = str(p.get("chainId") or "").capitalize()
+        boosts = int((p.get("boosts") or {}).get("active") or p.get("amount") or 0)
+        url = p.get("url") or p.get("links", [{}])[0].get("url") if p.get("links") else None
+        price_usd = safe_float(p.get("priceUsd"))
+        price_str = format_price(price_usd) if price_usd else ""
+
+        boost_str = f"  ⚡{boosts}" if boosts else ""
+        price_part = f"  •  {price_str}" if price_str else ""
+        name_part = html_link(f"{name} ${symbol}", url) or f"{html.escape(name)} ${html.escape(symbol)}"
+        lines.append(f"{i}. {name_part}  [{chain}]{price_part}{boost_str}")
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
 def main():
     load_config()
+    load_alerts()
     app = Application.builder().token(BOT_TOKEN).build()
+
+    # Admin commands
     app.add_handler(CommandHandler("setalpha", cmd_setalpha))
     app.add_handler(CommandHandler("clearalpha", cmd_clearalpha))
     app.add_handler(CommandHandler("setnotify", cmd_setnotify))
     app.add_handler(CommandHandler("clearnotify", cmd_clearnotify))
+
+    # User commands
+    app.add_handler(CommandHandler("alert", cmd_alert))
+    app.add_handler(CommandHandler("pnl", cmd_pnl))
+    app.add_handler(CommandHandler("trending", cmd_trending))
+
+    # Message handler
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
+
+    # Price alert background job
+    app.job_queue.run_repeating(check_price_alerts, interval=PRICE_ALERT_INTERVAL_SECONDS, first=10)
+
     logger.info("Alpha Guard is running.")
     app.run_polling(drop_pending_updates=True)
 
