@@ -46,9 +46,10 @@ TOKEN_ORDER_TIMEOUT_SECONDS = int(os.getenv("TOKEN_ORDER_TIMEOUT_SECONDS", "3"))
 TOKEN_REPLY_CACHE_SECONDS = int(os.getenv("TOKEN_REPLY_CACHE_SECONDS", "1800"))
 TOKEN_LOOKUP_MISS_CACHE_SECONDS = int(os.getenv("TOKEN_LOOKUP_MISS_CACHE_SECONDS", "300"))
 TOKEN_MAX_REPLIES_PER_MESSAGE = int(os.getenv("TOKEN_MAX_REPLIES_PER_MESSAGE", "0"))
-PNL_MEME_IMAGES_ENABLED = env_flag("PNL_MEME_IMAGES_ENABLED", "1")
-PNL_MEME_API_URL = os.getenv("PNL_MEME_API_URL", "https://api.imgflip.com/get_memes")
-PNL_BOT_LABEL = os.getenv("PNL_BOT_LABEL", "@RickBurpBot")
+PNL_ANIME_IMAGES_ENABLED = env_flag("PNL_ANIME_IMAGES_ENABLED", "1")
+PNL_ANIME_CHARACTER_DIR = os.getenv("PNL_ANIME_CHARACTER_DIR", "assets/pnl_characters")
+PNL_ANIME_API_BASE = os.getenv("PNL_ANIME_API_BASE", "https://nekos.best/api/v2")
+PNL_BOT_LABEL = os.getenv("PNL_BOT_LABEL", "@AlphaBot")
 TOKEN_TICKER_BLOCKLIST = {
     item.strip().upper()
     for item in os.getenv(
@@ -278,7 +279,6 @@ def parse_gemini_json(answer: str) -> dict:
 # --- Token details ---
 
 token_reply_cache: dict[tuple[int, int | None, str], float] = {}
-pnl_meme_cache = {"expires": 0.0, "templates": []}
 
 
 def safe_float(value):
@@ -844,7 +844,7 @@ def fetch_token_image(url: str):
     return fetch_image_from_url(url)
 
 
-def meme_reaction_name(multiplier: float | None) -> str:
+def pnl_reaction_name(multiplier: float | None) -> str:
     if multiplier is None:
         return "flat"
     if multiplier < 1:
@@ -858,119 +858,73 @@ def meme_reaction_name(multiplier: float | None) -> str:
     return "moon"
 
 
-def preferred_meme_templates(reaction: str) -> list[str]:
+def anime_categories(reaction: str) -> list[str]:
     return {
-        "rekt": [
-            "Sad Pablo Escobar",
-            "Hide the Pain Harold",
-            "This Is Fine",
-            "Disaster Girl",
-            "Crying Cat",
-            "Ight Imma Head Out",
-            "Surprised Pikachu",
-            "Waiting Skeleton",
-        ],
-        "flat": [
-            "Waiting Skeleton",
-            "Is This A Pigeon",
-            "They're The Same Picture",
-            "This Is Fine",
-            "Monkey Puppet",
-            "Change My Mind",
-            "Two Buttons",
-            "Ancient Aliens",
-        ],
-        "win": [
-            "Success Kid",
-            "Leonardo Dicaprio Cheers",
-            "Roll Safe Think About It",
-            "Doge",
-            "Surprised Pikachu",
-            "Epic Handshake",
-            "Oprah You Get A",
-            "X, X Everywhere",
-        ],
-        "send": [
-            "Leonardo Dicaprio Cheers",
-            "Success Kid",
-            "Expanding Brain",
-            "Doge",
-            "Oprah You Get A",
-            "Buff Doge vs. Cheems",
-            "The Rock Driving",
-            "Epic Handshake",
-        ],
-        "moon": [
-            "Leonardo Dicaprio Cheers",
-            "Expanding Brain",
-            "Doge",
-            "Oprah You Get A",
-            "Success Kid",
-            "X, X Everywhere",
-            "Epic Handshake",
-            "Ancient Aliens",
-        ],
-    }.get(reaction, ["Success Kid"])
+        "rekt": ["cry", "slap", "bonk"],
+        "flat": ["smug", "wave", "poke"],
+        "win": ["happy", "smile", "highfive", "wink"],
+        "send": ["dance", "happy", "highfive", "smile"],
+        "moon": ["dance", "happy", "smile", "wink"],
+    }.get(reaction, ["happy"])
 
 
-def load_meme_templates() -> list[dict]:
-    now = time.time()
-    if pnl_meme_cache["templates"] and pnl_meme_cache["expires"] > now:
-        return pnl_meme_cache["templates"]
+def local_anime_character_paths(reaction: str) -> list[str]:
+    roots = [
+        os.path.join(PNL_ANIME_CHARACTER_DIR, reaction),
+        PNL_ANIME_CHARACTER_DIR,
+    ]
+    paths = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for name in sorted(os.listdir(root)):
+            path = os.path.join(root, name)
+            if not os.path.isfile(path):
+                continue
+            if name.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+                paths.append(path)
+    return paths
 
-    data = fetch_json_url(PNL_MEME_API_URL, timeout=TOKEN_LOOKUP_TIMEOUT_SECONDS)
-    memes = ((data or {}).get("data") or {}).get("memes") or []
-    pnl_meme_cache["templates"] = memes
-    pnl_meme_cache["expires"] = now + 3600
-    return memes
+
+def load_local_anime_character(path: str):
+    from PIL import Image
+
+    image = Image.open(path).convert("RGBA")
+    if image.width < 16 or image.height < 16:
+        raise ValueError("local anime character image is too small")
+    return image
 
 
-def pick_meme_template(multiplier: float | None, seed_key: str = "") -> dict:
-    if not PNL_MEME_IMAGES_ENABLED:
-        raise ValueError("meme images are disabled")
+def fetch_anime_character_image(multiplier: float | None, seed_key: str = ""):
+    if not PNL_ANIME_IMAGES_ENABLED:
+        raise ValueError("anime images are disabled")
 
-    reaction = meme_reaction_name(multiplier)
-    templates = load_meme_templates()
-    if not templates:
-        raise ValueError("no meme templates returned")
+    reaction = pnl_reaction_name(multiplier)
+    rng = random.Random(f"{reaction}:{seed_key}")
+    local_paths = local_anime_character_paths(reaction)
+    if local_paths:
+        return load_local_anime_character(local_paths[rng.randrange(len(local_paths))])
 
-    templates_by_name = {
-        str(template.get("name", "")).strip().lower(): template
-        for template in templates
-        if template.get("url")
-    }
+    categories = anime_categories(reaction)
+    last_error = None
+    for category in rng.sample(categories, len(categories)):
+        try:
+            data = fetch_json_url(
+                f"{PNL_ANIME_API_BASE.rstrip('/')}/{urllib.parse.quote(category, safe='')}",
+                timeout=TOKEN_LOOKUP_TIMEOUT_SECONDS,
+            )
+            image_url = None
+            if isinstance(data, dict):
+                image_url = data.get("url")
+                results = data.get("results")
+                if not image_url and isinstance(results, list) and results:
+                    image_url = results[0].get("url")
+            if image_url:
+                return fetch_image_from_url(image_url)
+        except Exception as e:
+            last_error = e
 
-    candidates = []
-    seen_urls = set()
-
-    def add_candidate(template):
-        url = template.get("url")
-        if not url or url in seen_urls:
-            return
-        candidates.append(template)
-        seen_urls.add(url)
-
-    for preferred in preferred_meme_templates(reaction):
-        match = templates_by_name.get(preferred.lower())
-        if match:
-            add_candidate(match)
-
-    for preferred in preferred_meme_templates(reaction):
-        preferred_key = preferred.lower()
-        for name, template in templates_by_name.items():
-            if preferred_key in name or name in preferred_key:
-                add_candidate(template)
-
-    if candidates:
-        rng = random.Random(f"{reaction}:{seed_key}")
-        return candidates[rng.randrange(len(candidates))]
-
-    fallback = [template for template in templates if template.get("url")]
-    if fallback:
-        rng = random.Random(f"fallback:{reaction}:{seed_key}")
-        return fallback[rng.randrange(len(fallback))]
-
-    raise ValueError(f"no meme template matched reaction={reaction}")
+    raise ValueError(f"anime character fetch failed: {last_error}")
 
 
 def image_average_color(image) -> tuple[int, int, int]:
@@ -986,8 +940,7 @@ def generate_pnl_image(pair: dict, token: dict, chain_id: str, drop_record: dict
 
     metrics = build_pnl_metrics(pair, token, chain_id, drop_record)
     seed = f"{metrics['token_address']}:{drop_record.get('dropped_at')}"
-    meme_template = pick_meme_template(metrics["multiplier"], seed)
-    meme_image = fetch_image_from_url(meme_template["url"])
+    character_image = fetch_anime_character_image(metrics["multiplier"], seed)
     token_image = None
     if metrics["image_url"]:
         try:
@@ -998,7 +951,7 @@ def generate_pnl_image(pair: dict, token: dict, chain_id: str, drop_record: dict
     width, height = 1280, 720
     rng = random.Random(seed)
 
-    source_image = meme_image
+    source_image = character_image
     accent = image_average_color(source_image)
     green = (34, 255, 24)
     lime = (165, 255, 71)
@@ -1037,7 +990,7 @@ def generate_pnl_image(pair: dict, token: dict, chain_id: str, drop_record: dict
     bot_font = fit_text(draw, pnl_label, bot_font, 440, min_size=22, bold=True)
     draw.text((74, 54), pnl_label, font=bot_font, fill=(255, 226, 116, 255), stroke_width=3, stroke_fill=(0, 0, 0, 190))
 
-    meme_art = ImageOps.fit(meme_image, (565, 565), method=Image.Resampling.LANCZOS)
+    character_art = ImageOps.fit(character_image, (565, 565), method=Image.Resampling.LANCZOS)
     mask = Image.new("L", (565, 565), 0)
     mask_draw = ImageDraw.Draw(mask)
     mask_draw.rounded_rectangle([0, 0, 564, 564], radius=42, fill=255)
@@ -1048,7 +1001,7 @@ def generate_pnl_image(pair: dict, token: dict, chain_id: str, drop_record: dict
     image.alpha_composite(shadow, (16, 92))
     draw.rounded_rectangle([54, 118, 619, 683], radius=46, fill=(255, 255, 255, 214))
     draw.rounded_rectangle([62, 126, 611, 675], radius=38, fill=(*accent, 235))
-    image.paste(meme_art, (62, 126), mask)
+    image.paste(character_art, (62, 126), mask)
 
     if token_image:
         badge = ImageOps.fit(token_image, (96, 96), method=Image.Resampling.LANCZOS)
