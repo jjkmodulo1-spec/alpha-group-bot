@@ -56,7 +56,7 @@ TOKEN_TICKER_BLOCKLIST = {
 MORALIS_API_KEY = os.getenv("MORALIS_API_KEY", "").strip()
 PRICE_ALERT_INTERVAL_SECONDS = int(os.getenv("PRICE_ALERT_INTERVAL_SECONDS", "60"))
 HONEYPOT_TIMEOUT_SECONDS = int(os.getenv("HONEYPOT_TIMEOUT_SECONDS", "5"))
-TRENDING_CHAIN = os.getenv("TRENDING_CHAIN", "").strip().lower()
+TRENDING_CHAIN = os.getenv("TRENDING_CHAIN", "base").strip().lower()
 
     r"("
     r"0x[a-fA-F0-9]{40}"
