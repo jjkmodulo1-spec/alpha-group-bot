@@ -9,7 +9,9 @@ import re
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from collections import defaultdict, deque
+from datetime import datetime, timezone
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -45,7 +47,7 @@ TOKEN_LOOKUP_TIMEOUT_SECONDS = int(os.getenv("TOKEN_LOOKUP_TIMEOUT_SECONDS", "6"
 TOKEN_ORDER_TIMEOUT_SECONDS = int(os.getenv("TOKEN_ORDER_TIMEOUT_SECONDS", "3"))
 TOKEN_REPLY_CACHE_SECONDS = int(os.getenv("TOKEN_REPLY_CACHE_SECONDS", "1800"))
 TOKEN_LOOKUP_MISS_CACHE_SECONDS = int(os.getenv("TOKEN_LOOKUP_MISS_CACHE_SECONDS", "300"))
-TOKEN_MAX_REPLIES_PER_MESSAGE = int(os.getenv("TOKEN_MAX_REPLIES_PER_MESSAGE", "0"))
+TOKEN_MAX_REPLIES_PER_MESSAGE = int(os.getenv("TOKEN_MAX_REPLIES_PER_MESSAGE", "1"))
 PNL_ANIME_IMAGES_ENABLED = env_flag("PNL_ANIME_IMAGES_ENABLED", "1")
 PNL_ANIME_CHARACTER_DIR = os.getenv("PNL_ANIME_CHARACTER_DIR", "assets/pnl_characters")
 PNL_ANIME_API_BASE = os.getenv("PNL_ANIME_API_BASE", "https://nekos.best/api/v2")
@@ -104,6 +106,24 @@ def load_config():
 def save_config():
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(_config, f)
+
+def get_trusted_users(chat_id: int) -> list[int]:
+    return _config.get("trusted_users", {}).get(str(chat_id), [])
+
+def add_trusted_user(chat_id: int, user_id: int):
+    trusted = _config.setdefault("trusted_users", {})
+    key = str(chat_id)
+    if user_id not in trusted.get(key, []):
+        trusted.setdefault(key, []).append(user_id)
+    save_config()
+
+def remove_trusted_user(chat_id: int, user_id: int):
+    trusted = _config.get("trusted_users", {})
+    key = str(chat_id)
+    if key in trusted and user_id in trusted[key]:
+        trusted[key].remove(user_id)
+    save_config()
+
 
 def get_notify_chat_id():
     val = _config.get("notify_chat_id")
@@ -200,6 +220,10 @@ def save_ca_drop_if_new(message, token_result: dict):
 # --- Rolling context ---
 
 thread_buffers = defaultdict(lambda: deque(maxlen=BUFFER_LIMIT))
+
+# Tracks every user the bot has seen post in a chat — used for alarm mentions
+# { chat_id: { user_id: mention_html } }
+chat_seen_users: dict[int, dict[int, str]] = defaultdict(dict)
 
 def message_text(message) -> str:
     return (message.text or message.caption or "").strip()
@@ -1126,19 +1150,31 @@ async def maybe_reply_token_details(message, text: str):
     if not queries:
         return
 
-    sent = 0
-    for query in queries:
-        if TOKEN_MAX_REPLIES_PER_MESSAGE > 0 and sent >= TOKEN_MAX_REPLIES_PER_MESSAGE:
-            break
+    # Slice upfront before launching any network calls
+    if TOKEN_MAX_REPLIES_PER_MESSAGE > 0:
+        queries = queries[:TOKEN_MAX_REPLIES_PER_MESSAGE]
 
+    # Filter out already-cached ticker queries before hitting DexScreener
+    active_queries = []
+    for query in queries:
         chain_id = query_chain_id(query)
         query_key = token_cache_key(message, f"query:{chain_id}:{query['type']}:{query['value'].lower()}")
         is_ca = query["type"] == "address"
         if not is_ca and token_cache_active(query_key):
             continue
+        active_queries.append((query, query_key, is_ca))
 
-        result = await asyncio.to_thread(build_token_detail_reply, query)
-        if not result:
+    if not active_queries:
+        return
+
+    # Fetch all results concurrently instead of serially
+    results = await asyncio.gather(
+        *[asyncio.to_thread(build_token_detail_reply, q) for q, _, _ in active_queries],
+        return_exceptions=True,
+    )
+
+    for (query, query_key, is_ca), result in zip(active_queries, results):
+        if isinstance(result, Exception) or result is None:
             mark_token_cache(query_key, TOKEN_LOOKUP_MISS_CACHE_SECONDS)
             continue
 
@@ -1159,7 +1195,6 @@ async def maybe_reply_token_details(message, text: str):
             if not is_ca:
                 mark_token_cache(query_key, TOKEN_REPLY_CACHE_SECONDS)
                 mark_token_cache(token_key, TOKEN_REPLY_CACHE_SECONDS)
-            sent += 1
         except Exception as e:
             logger.error(f"Token detail reply failed: {e}")
 
@@ -1268,6 +1303,9 @@ async def should_delete_message(message, text: str, context_items) -> tuple[bool
 async def is_admin(update: Update) -> bool:
     member = await update.effective_chat.get_member(update.effective_user.id)
     return member.status in ("administrator", "creator")
+
+async def is_trusted(update: Update) -> bool:
+    return update.effective_user.id in get_trusted_users(update.effective_chat.id)
 
 
 async def cmd_setalpha(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1455,6 +1493,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         return
 
+    # Record this user so the alarm fire can mention everyone
+    if user.username:
+        chat_seen_users[message.chat_id][user.id] = f"@{html.escape(user.username)}"
+    else:
+        chat_seen_users[message.chat_id][user.id] = f'<a href="tg://user?id={user.id}">{html.escape(user.first_name)}</a>'
+
     text = message_text(message)
 
     # Media-only messages are usually charts/screenshots and are kept.
@@ -1492,6 +1536,702 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await maybe_reply_token_details(message, text)
         return
 
+# ---------------------------------------------------------------------------
+# Alarm system
+# ---------------------------------------------------------------------------
+
+# Countdown checkpoints: send a reminder this many seconds BEFORE the event
+ALARM_CHECKPOINTS: list[int] = [86400, 21600, 3600, 600]  # 24h, 6h, 1h, 10min
+
+ALARM_CHECKPOINT_META: dict[int, tuple[str, str]] = {
+    86400: ("📅", "24 hours"),
+    21600: ("⏳", "6 hours"),
+    3600:  ("🔔", "1 hour"),
+    600:   ("🚨", "10 minutes"),
+}
+
+ALARM_EVENT_EMOJIS: dict[str, str] = {
+    "nft":        "🎨",
+    "mint":       "🎨",
+    "airdrop":    "🪂",
+    "claim":      "🪂",
+    "space":      "🎙️",
+    "ama":        "🎙️",
+    "listing":    "📈",
+    "list":       "📈",
+    "unlock":     "🔓",
+    "vesting":    "🔓",
+    "launch":     "🚀",
+    "snapshot":   "📸",
+    "vote":       "🗳️",
+    "presale":    "💰",
+    "sale":       "💰",
+    "ido":        "💰",
+    "burn":       "🔥",
+    "migration":  "🔄",
+    "migrate":    "🔄",
+    "twitter":    "🐦",
+    "stream":     "📡",
+    "live":       "📡",
+    "whitelist":  "📋",
+    "wl":         "📋",
+    "raffle":     "🎰",
+    "reveal":     "🖼️",
+    "drop":       "💧",
+}
+
+# Regex: detects a timezone or UTC offset in user text — required for absolute times
+_TZ_RE = re.compile(
+    r"(?:\b(UTC|GMT|EST|EDT|CST|CDT|MST|MDT|PST|PDT|CET|CEST|EET|EEST|BST|IST|"
+    r"JST|KST|AEST|AEDT|NZST|NZDT|HKT|SGT|WIB|WIT|WITA|MSK|AST|NST|NDT|"
+    r"ART|BRT|CLT|PET|VET|COT|ECT|BOT|UYT|PYT|GYT|SRT|TRT|EAT|WAT|CAT)\b"
+    r"|[+-]\d{2}:?\d{2})",   # numeric offsets like +05:30 or -0800
+    re.IGNORECASE,
+)
+
+# Regex: detects purely relative time expressions — these don't need a timezone
+_RELATIVE_TIME_RE = re.compile(
+    r"\bin\s+\d+\s*(second|minute|min|hour|hr|day|week|month)s?\b"
+    r"|\b\d+\s*(second|minute|min|hour|hr|day|week|month)s?\s+(from\s+now|later)\b",
+    re.IGNORECASE,
+)
+
+# Regex: detects absolute time indicators that DO require a timezone
+_ABSOLUTE_TIME_RE = re.compile(
+    r"\b(\d{1,2}(:\d{2})?\s*(am|pm)|noon|midnight|midday"
+    r"|(\d{1,2}:\d{2})"                         # 15:00 style
+    r"|(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{1,2}"  # May 20
+    r"|\d{1,2}[/\-]\d{1,2}([/\-]\d{2,4})?"      # 05/20, 5-20-2025
+    r"|tomorrow|tonight|next\s+\w+"              # tomorrow, tonight, next Friday
+    r"|(monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b",
+    re.IGNORECASE,
+)
+
+
+def check_timezone_requirement(text: str) -> tuple[bool, str | None]:
+    """Check whether the alarm text needs a timezone and has one.
+
+    Returns (ok, error_message_or_None).
+    - If purely relative ('in 2 hours') → ok=True, no timezone needed.
+    - If absolute time detected without a timezone → ok=False with a helpful message.
+    - If timezone present → ok=True.
+    """
+    has_tz = bool(_TZ_RE.search(text))
+    if has_tz:
+        return True, None
+
+    is_relative = bool(_RELATIVE_TIME_RE.search(text))
+    if is_relative:
+        return True, None  # relative times are unambiguous without TZ
+
+    has_absolute = bool(_ABSOLUTE_TIME_RE.search(text))
+    if has_absolute:
+        return False, (
+            "⚠️ <b>Please include a timezone</b> so I know exactly when to fire the alarm.\n\n"
+            "Add <b>UTC</b> or <b>GMT</b> (recommended), or your local zone:\n"
+            "<code>UTC · GMT · EST · PST · CET · IST · JST · +05:30</code>\n\n"
+            "Examples:\n"
+            "  <code>/alarm BAYC mint tomorrow 3pm UTC</code>\n"
+            "  <code>/alarm space tonight 8pm EST</code>\n"
+            "  <code>/alarm listing May 20 at noon GMT</code>"
+        )
+
+    # No time detected at all — let Gemini try, it will fail gracefully
+    return True, None
+
+
+def alarm_emoji(event_label: str) -> str:
+    words = re.split(r"[\s_/$]+", event_label.lower())
+    for word in words:
+        if word in ALARM_EVENT_EMOJIS:
+            return ALARM_EVENT_EMOJIS[word]
+    return "⏰"
+
+
+def format_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        m, s = divmod(seconds, 60)
+        return f"{m}m" + (f" {s}s" if s else "")
+    if seconds < 86400:
+        h, rem = divmod(seconds, 3600)
+        m = rem // 60
+        return f"{h}h" + (f" {m}m" if m else "")
+    d, rem = divmod(seconds, 86400)
+    h = rem // 3600
+    return f"{d}d" + (f" {h}h" if h else "")
+
+
+# --- Alarm storage helpers ---
+
+def get_alarms() -> dict:
+    return _config.setdefault("alarms", {})
+
+
+def save_alarm(alarm: dict):
+    get_alarms()[alarm["id"]] = alarm
+    save_config()
+
+
+def delete_alarm(alarm_id: str):
+    get_alarms().pop(alarm_id, None)
+    save_config()
+
+
+def list_chat_alarms(chat_id: int) -> list[dict]:
+    now = time.time()
+    return sorted(
+        [a for a in get_alarms().values()
+         if a["chat_id"] == chat_id and a["fire_at"] > now],
+        key=lambda a: a["fire_at"],
+    )
+
+
+# --- Gemini NLP alarm parser ---
+
+def parse_alarm_with_gemini(raw_text: str) -> dict | None:
+    """Send raw natural-language text to Gemini and extract label + fire_at.
+
+    Returns {"label": str, "fire_at": float} or None on failure.
+    """
+    now_utc = datetime.now(timezone.utc)
+    now_unix = int(now_utc.timestamp())
+    now_str = now_utc.strftime("%A, %Y-%m-%d %H:%M UTC")
+
+    prompt = (
+        "You are a crypto group bot parsing a user's alarm or reminder request.\n"
+        f"Current time: {now_str}  (Unix: {now_unix})\n\n"
+        "Extract:\n"
+        "  label  — short, clear event name (max 80 chars). Keep token names, tickers, handles.\n"
+        "  fire_at_unix — exact Unix timestamp (integer) when the event happens / alarm should fire.\n\n"
+        "Rules:\n"
+        "- If no timezone is mentioned, assume UTC.\n"
+        "- 'tomorrow' = next calendar day at the stated time (or 09:00 UTC if no time given).\n"
+        "- 'tonight' = today at 20:00 UTC if no time given.\n"
+        "- 'in X hours/minutes/days' → add to current Unix timestamp.\n"
+        "- Dates without year: use the nearest future occurrence.\n"
+        "- confidence: 0.0–1.0 reflecting how certain you are about the parsed time.\n\n"
+        f'User text: "{raw_text}"\n\n'
+        "Return ONLY valid JSON — no markdown, no explanation:\n"
+        '{"label":"<event name>","fire_at_unix":<integer>,"confidence":<float>,"error":null}\n\n'
+        "If you cannot determine a time, return:\n"
+        '{"label":null,"fire_at_unix":null,"confidence":0.0,"error":"<short reason>"}'
+    )
+
+    body = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "maxOutputTokens": 160,
+            "temperature": 0,
+            "responseMimeType": "application/json",
+        },
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        GEMINI_URL,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT_SECONDS) as resp:
+            data = json.loads(resp.read())
+            answer = data["candidates"][0]["content"]["parts"][0]["text"]
+            result = parse_gemini_json(answer)
+    except Exception as e:
+        logger.error(f"Gemini alarm parse failed: {e}")
+        return None
+
+    confidence = safe_float(result.get("confidence")) or 0.0
+    fire_at_raw = result.get("fire_at_unix")
+    label = result.get("label")
+
+    if not label or fire_at_raw is None or confidence < 0.55:
+        logger.info(
+            f"Alarm parse low-confidence: label={label!r} "
+            f"fire_at={fire_at_raw} confidence={confidence:.2f} "
+            f"error={result.get('error')!r}"
+        )
+        return None
+
+    fire_at = float(fire_at_raw)
+    if fire_at <= time.time():
+        return None
+
+    return {"label": str(label)[:200].strip(), "fire_at": fire_at, "confidence": confidence}
+
+
+# --- Job callbacks ---
+
+async def fire_countdown(context: ContextTypes.DEFAULT_TYPE):
+    """Sends a pre-event reminder at a checkpoint (24h / 6h / 1h / 10min before)."""
+    data = context.job.data
+    alarm_id = data["alarm_id"]
+    seconds_before = data["seconds_before"]
+
+    if alarm_id not in get_alarms():
+        return  # alarm was cancelled
+
+    alarm = get_alarms()[alarm_id]
+    chat_id = alarm["chat_id"]
+    thread_id = alarm.get("thread_id")
+    label = html.escape(alarm.get("label", "Event"))
+    evt_emoji = alarm_emoji(alarm.get("label", ""))
+    cp_emoji, cp_label = ALARM_CHECKPOINT_META.get(seconds_before, ("⏰", format_duration(seconds_before)))
+
+    fire_dt = datetime.fromtimestamp(alarm["fire_at"], tz=timezone.utc)
+    fire_str = fire_dt.strftime("%H:%M UTC")
+
+    # At 10 minutes: send mention batches first, then the countdown message
+    if seconds_before == 600:
+        seen = list((chat_seen_users.get(chat_id) or {}).values())
+        batch: list[str] = []
+        char_count = 0
+        BATCH_CHAR_LIMIT = 3800
+        BATCH_SIZE_LIMIT = 25
+
+        async def flush_batch(b: list[str]):
+            if not b:
+                return
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    message_thread_id=thread_id,
+                    text="👥 " + " ".join(b),
+                    parse_mode="HTML",
+                )
+                await asyncio.sleep(0.7)
+            except Exception as e:
+                logger.error(f"Mention batch failed (alarm={alarm_id}): {e}")
+
+        for mention in seen:
+            if len(batch) >= BATCH_SIZE_LIMIT or char_count + len(mention) > BATCH_CHAR_LIMIT:
+                await flush_batch(batch)
+                batch = []
+                char_count = 0
+            batch.append(mention)
+            char_count += len(mention) + 1
+
+        await flush_batch(batch)
+
+    text = (
+        f"{cp_emoji} <b>{cp_label} until:</b> {evt_emoji} <b>{label}</b>\n"
+        f"🕐 Fires at {fire_str} — use /alarms to see all events"
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            text=text,
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error(f"Countdown notification failed (alarm={alarm_id}, before={seconds_before}s): {e}")
+
+
+def generate_alarm_fire_message(label: str, creator_mention: str, emoji: str) -> str:
+    """Ask Gemini to write a hype fire message for this specific event.
+
+    Falls back to the hardcoded message if Gemini fails or times out.
+    """
+    fallback = (
+        f"🔥 {emoji} <b>IT'S TIME!</b> {emoji} 🔥\n\n"
+        f"<b>{html.escape(label)}</b>\n\n"
+        f"⚡ Set by {creator_mention}"
+    )
+
+    prompt = (
+        "You are the notification bot for a crypto alpha Telegram group.\n"
+        "An event is happening RIGHT NOW. Write a short, high-energy alert message for the group.\n\n"
+        "Rules:\n"
+        "- 2 to 4 lines max. No fluff, no filler.\n"
+        "- Match the energy to the event: a mint is hype, an AMA is informative, a listing is urgent.\n"
+        "- Always include the event name bold using HTML: <b>event name</b>\n"
+        "- End with one line: ⚡ Set by {creator}\n"
+        "- Use relevant emojis but don't overdo it.\n"
+        "- Output plain HTML-safe Telegram message text only. No JSON, no markdown, no code blocks.\n\n"
+        f"Event: {label}\n"
+        f"Creator: {creator_mention}\n"
+    )
+
+    body = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "maxOutputTokens": 120,
+            "temperature": 0.9,
+        },
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        GEMINI_URL,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT_SECONDS) as resp:
+            data = json.loads(resp.read())
+            text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            if text:
+                return text
+    except Exception as e:
+        logger.warning(f"Gemini fire message failed for '{label}': {e}")
+
+    return fallback
+
+
+async def fire_alarm(context: ContextTypes.DEFAULT_TYPE):
+    """Fires the main alarm — IT'S TIME message."""
+    alarm = context.job.data
+    alarm_id = alarm["id"]
+
+    if alarm_id not in get_alarms():
+        return
+
+    delete_alarm(alarm_id)
+
+    chat_id = alarm["chat_id"]
+    thread_id = alarm.get("thread_id")
+    raw_label = alarm.get("label", "Event")
+    emoji = alarm_emoji(raw_label)
+    creator = alarm.get("created_by") or "the group"
+    creator_mention = f"@{html.escape(creator)}" if creator != "the group" else creator
+
+    main_text = await asyncio.to_thread(
+        generate_alarm_fire_message, raw_label, creator_mention, emoji
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            text=main_text,
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error(f"Alarm fire failed (id={alarm_id}): {e}")
+
+
+# --- Scheduling helpers ---
+
+def schedule_alarm(alarm: dict, app):
+    """Register the main alarm job + all applicable countdown jobs."""
+    now = time.time()
+    fire_at = alarm["fire_at"]
+    alarm_id = alarm["id"]
+
+    # Countdown notifications — only schedule those that are still in the future
+    for seconds_before in ALARM_CHECKPOINTS:
+        trigger_at = fire_at - seconds_before
+        delay = trigger_at - now
+        if delay > 5:
+            app.job_queue.run_once(
+                fire_countdown,
+                when=delay,
+                data={"alarm_id": alarm_id, "seconds_before": seconds_before},
+                name=f"alarm:{alarm_id}:cp:{seconds_before}",
+            )
+
+    # Main fire job
+    app.job_queue.run_once(
+        fire_alarm,
+        when=max(0.0, fire_at - now),
+        data=alarm,
+        name=f"alarm:{alarm_id}:fire",
+    )
+
+
+def cancel_alarm_jobs(alarm_id: str, app):
+    """Remove all PTB jobs associated with an alarm."""
+    job_names = [f"alarm:{alarm_id}:fire"] + [
+        f"alarm:{alarm_id}:cp:{cp}" for cp in ALARM_CHECKPOINTS
+    ]
+    for name in job_names:
+        for job in app.job_queue.get_jobs_by_name(name):
+            job.schedule_removal()
+
+
+async def _create_and_confirm_alarm(
+    message,
+    application,
+    label: str,
+    fire_at: float,
+    created_by: str,
+    *,
+    natural: bool = False,
+) -> None:
+    """Persist + schedule an alarm and reply with a confirmation."""
+    alarm_id = str(uuid.uuid4())[:8]
+    alarm = {
+        "id": alarm_id,
+        "chat_id": message.chat_id,
+        "thread_id": message.message_thread_id,
+        "label": label,
+        "fire_at": fire_at,
+        "created_by": created_by,
+        "created_at": time.time(),
+    }
+    save_alarm(alarm)
+    schedule_alarm(alarm, application)
+
+    emoji = alarm_emoji(label)
+    fire_dt = datetime.fromtimestamp(fire_at, tz=timezone.utc)
+    fire_str = fire_dt.strftime("%A, %b %d %Y at %H:%M UTC")
+    seconds_until = max(0, int(fire_at - time.time()))
+
+    now = time.time()
+    active_cps = [cp for cp in ALARM_CHECKPOINTS if fire_at - cp - now > 5]
+    cp_labels = [ALARM_CHECKPOINT_META[cp][1] for cp in active_cps]
+    notify_line = f"🔔 Reminders: {', '.join(cp_labels)} before" if cp_labels else ""
+
+    intro = "Got it! Alarm set 👌" if natural else f"{emoji} Alarm set!"
+    reply = (
+        f"{emoji} <b>{intro}</b>\n\n"
+        f"📌 <b>{html.escape(label)}</b>\n"
+        f"🕐 <b>{fire_str}</b>\n"
+        f"⏱ In <b>{format_duration(seconds_until)}</b>\n"
+    )
+    if notify_line:
+        reply += f"{notify_line}\n"
+    reply += f"\nID: <code>{alarm_id}</code>"
+
+    await message.reply_text(reply, parse_mode="HTML")
+
+
+# --- Trusted user commands ---
+
+async def cmd_addtrusted(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        await update.message.reply_text("Admins only.")
+        return
+
+    message = update.message
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        await message.reply_text("Reply to the user's message with /addtrusted.")
+        return
+
+    target = message.reply_to_message.from_user
+    add_trusted_user(message.chat_id, target.id)
+    name = f"@{target.username}" if target.username else target.first_name
+    await message.reply_text(f"✅ {html.escape(name)} added to trusted. They can now set alarms.", parse_mode="HTML")
+
+
+async def cmd_removetrusted(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        await update.message.reply_text("Admins only.")
+        return
+
+    message = update.message
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        await message.reply_text("Reply to the user's message with /removetrusted.")
+        return
+
+    target = message.reply_to_message.from_user
+    remove_trusted_user(message.chat_id, target.id)
+    name = f"@{target.username}" if target.username else target.first_name
+    await message.reply_text(f"✅ {html.escape(name)} removed from trusted.", parse_mode="HTML")
+
+
+async def cmd_listtrusted(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        await update.message.reply_text("Admins only.")
+        return
+
+    trusted = get_trusted_users(update.message.chat_id)
+    if not trusted:
+        await update.message.reply_text("No trusted users for this chat.")
+        return
+
+    lines = ["<b>Trusted Users</b>"]
+    for uid in trusted:
+        try:
+            member = await update.effective_chat.get_member(uid)
+            user = member.user
+            name = f"@{user.username}" if user.username else html.escape(user.first_name)
+        except Exception:
+            name = str(uid)
+        lines.append(f"• {name} — <code>{uid}</code>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+# --- Commands ---
+
+async def cmd_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set an alarm — accepts fully natural language, no fixed format needed.
+
+    Examples (all work):
+      /alarm BAYC mint tomorrow 3pm UTC
+      /alarm airdrop claim in 2 hours
+      /alarm $TOKEN listing on Binance May 20 at noon
+      /alarm CryptoAlpha Twitter space tonight 8pm EST
+      /alarm snapshot in 30 minutes
+    """
+    message = update.message
+    if not message:
+        return
+
+    if not await is_admin(update) and not await is_trusted(update):
+        await message.reply_text("Only admins and trusted users can set alarms.")
+        return
+
+    raw = " ".join(context.args or []).strip()
+    if not raw:
+        await message.reply_text(
+            "⏰ <b>Set an Alarm — just describe it naturally!</b>\n\n"
+            "Examples:\n"
+            "  /alarm BAYC mint tomorrow 3pm <b>UTC</b>\n"
+            "  /alarm airdrop claim in 2 hours\n"
+            "  /alarm CryptoAlpha space tonight 8pm <b>EST</b>\n"
+            "  /alarm $TOKEN listing on Binance May 20 12pm <b>UTC</b>\n"
+            "  /alarm snapshot in 30 minutes\n"
+            "  /alarm WL raffle next Friday 6pm <b>GMT</b>\n\n"
+            "📌 Include a timezone (UTC, GMT, EST…) for specific times.\n"
+            "📌 Relative times like <i>in 2 hours</i> don't need one.\n\n"
+            "I'll ping the group at 24h, 6h, 1h, and 10min before! 🚀",
+            parse_mode="HTML",
+        )
+        return
+
+    # Validate timezone before hitting Gemini
+    tz_ok, tz_error = check_timezone_requirement(raw)
+    if not tz_ok:
+        await message.reply_text(tz_error, parse_mode="HTML")
+        return
+
+    thinking = await message.reply_text("⏳ Parsing your alarm…")
+    parsed = await asyncio.to_thread(parse_alarm_with_gemini, raw)
+
+    try:
+        await thinking.delete()
+    except Exception:
+        pass
+
+    if not parsed:
+        await message.reply_text(
+            "⚠️ I couldn't figure out the time from that.\n\n"
+            "Try being a bit more specific:\n"
+            "  <code>/alarm NFT mint tomorrow 3pm UTC</code>\n"
+            "  <code>/alarm airdrop in 2 hours</code>\n"
+            "  <code>/alarm space May 20 at 5pm UTC</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    if parsed["fire_at"] - time.time() > 90 * 86400:
+        await message.reply_text("⚠️ Maximum alarm duration is 90 days.")
+        return
+
+    user = update.effective_user
+    created_by = (user.username or user.first_name or str(user.id)) if user else "unknown"
+    await _create_and_confirm_alarm(
+        message, context.application, parsed["label"], parsed["fire_at"], created_by
+    )
+
+
+async def cmd_alarms(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all upcoming alarms for this chat."""
+    message = update.message
+    if not message:
+        return
+
+    upcoming = list_chat_alarms(message.chat_id)
+    if not upcoming:
+        await message.reply_text("No active alarms for this chat.")
+        return
+
+    now = time.time()
+    lines = ["<b>⏰ Upcoming Alarms</b>\n"]
+    for alarm in upcoming:
+        remaining = max(0, int(alarm["fire_at"] - now))
+        emoji = alarm_emoji(alarm.get("label", ""))
+        label = html.escape(alarm.get("label", "?"))
+        alarm_id = alarm["id"]
+        creator = html.escape(alarm.get("created_by", "?"))
+        fire_dt = datetime.fromtimestamp(alarm["fire_at"], tz=timezone.utc)
+        fire_str = fire_dt.strftime("%b %d, %H:%M UTC")
+        lines.append(
+            f"{emoji} <b>{label}</b>\n"
+            f"   🕐 {fire_str} — in {format_duration(remaining)}\n"
+            f"   👤 @{creator} • ID: <code>{alarm_id}</code>"
+        )
+
+    await message.reply_text("\n\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_cancelalarm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel an alarm by ID. Get IDs from /alarms."""
+    message = update.message
+    if not message:
+        return
+
+    args = context.args or []
+    if not args:
+        await message.reply_text("Usage: /cancelalarm <alarm_id>\nGet IDs with /alarms")
+        return
+
+    alarm_id = args[0].strip()
+    alarm = get_alarms().get(alarm_id)
+
+    if not alarm:
+        await message.reply_text(
+            f"⚠️ No active alarm with ID <code>{html.escape(alarm_id)}</code>.",
+            parse_mode="HTML",
+        )
+        return
+
+    user = update.effective_user
+    creator = alarm.get("created_by", "")
+    is_creator = user and (
+        user.username == creator
+        or user.first_name == creator
+        or str(user.id) == creator
+    )
+    if not is_creator and not await is_admin(update):
+        await message.reply_text("⚠️ Only admins or the alarm creator can cancel this.")
+        return
+
+    cancel_alarm_jobs(alarm_id, context.application)
+    delete_alarm(alarm_id)
+    label = html.escape(alarm.get("label", "?"))
+    await message.reply_text(f"✅ Alarm cancelled: <b>{label}</b>", parse_mode="HTML")
+
+
+
+
+
+# --- Startup restore ---
+
+def restore_alarms(app):
+    """Re-schedule alarms and their countdown jobs after a restart."""
+    now = time.time()
+    alarms = get_alarms()
+    stale: list[str] = []
+    restored = 0
+
+    for alarm_id, alarm in list(alarms.items()):
+        if alarm["fire_at"] <= now:
+            stale.append(alarm_id)
+        else:
+            schedule_alarm(alarm, app)
+            restored += 1
+
+    for alarm_id in stale:
+        alarms.pop(alarm_id)
+    if stale:
+        save_config()
+
+    if restored:
+        logger.info(f"Restored {restored} pending alarm(s) from config.")
+    if stale:
+        logger.info(f"Purged {len(stale)} expired alarm(s) from config.")
+
+
 def main():
     load_config()
     app = Application.builder().token(BOT_TOKEN).build()
@@ -1503,7 +2243,16 @@ def main():
     app.add_handler(CommandHandler("clearca", cmd_clearca))
     app.add_handler(CommandHandler("setpnllabel", cmd_setpnllabel))
     app.add_handler(CommandHandler("pnl", cmd_pnl))
+    # Alarm commands
+    app.add_handler(CommandHandler("alarm", cmd_alarm))
+    app.add_handler(CommandHandler("alarms", cmd_alarms))
+    app.add_handler(CommandHandler("cancelalarm", cmd_cancelalarm))
+    app.add_handler(CommandHandler("addtrusted", cmd_addtrusted))
+    app.add_handler(CommandHandler("removetrusted", cmd_removetrusted))
+    app.add_handler(CommandHandler("listtrusted", cmd_listtrusted))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
+    # Restore persisted alarms after the app is built but before polling starts
+    restore_alarms(app)
     logger.info("Alpha Guard is running.")
     app.run_polling(drop_pending_updates=True)
 
