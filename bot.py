@@ -1747,12 +1747,22 @@ def _sanity_check_parsed(raw_text: str, parsed: dict) -> bool:
 
     fire_dt = datetime.fromtimestamp(fire_at, tz=timezone.utc)
 
-    # If the user mentioned a specific hour (e.g. "13:00" or "3pm"), verify the
-    # parsed hour is within ±1 of what they wrote (accounting for AM/PM conversion).
-    hour_match = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", raw_text, re.IGNORECASE)
-    if hour_match:
-        stated_hour = int(hour_match.group(1))
-        ampm = (hour_match.group(3) or "").lower()
+    # If the user mentioned a specific clock time (e.g. "13:00" or "3pm"), verify
+    # the parsed hour is within ±1 of what they wrote (accounting for AM/PM).
+    # IMPORTANT: only match actual clock times — require am/pm OR HH:MM colon
+    # notation, so bare duration numbers like "2" in "in 2 hours" are NOT matched.
+    clock_match = re.search(
+        r"\b(\d{1,2}):(\d{2})\b"        # group 1,2: HH:MM  (e.g. 15:00, 3:30)
+        r"|\b(\d{1,2})\s*(am|pm)\b",     # group 3,4: Xam/pm (e.g. 3pm, 8 AM)
+        raw_text, re.IGNORECASE,
+    )
+    if clock_match:
+        if clock_match.group(1) is not None:   # HH:MM branch
+            stated_hour = int(clock_match.group(1))
+            ampm = ""
+        else:                                   # X am/pm branch
+            stated_hour = int(clock_match.group(3))
+            ampm = (clock_match.group(4) or "").lower()
         if ampm == "pm" and stated_hour < 12:
             stated_hour += 12
         elif ampm == "am" and stated_hour == 12:
@@ -2301,7 +2311,7 @@ async def cmd_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = " ".join(context.args or []).strip()
     if not raw:
         await message.reply_text(
-            "⏰ <b>Set an Alarm — just describe it naturally!</b>\n\n"
+            "⏰ <b>Set an Alarm</b> — just describe it naturally and I'll figure out the time!\n\n"
             "Examples:\n"
             "  /alarm BAYC mint tomorrow 3pm <b>UTC</b>\n"
             "  /alarm airdrop claim in 2 hours\n"
@@ -2309,14 +2319,12 @@ async def cmd_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  /alarm $TOKEN listing on Binance May 20 12pm <b>UTC</b>\n"
             "  /alarm snapshot in 30 minutes\n"
             "  /alarm WL raffle next Friday 6pm <b>GMT</b>\n\n"
-            "📌 Include a timezone (UTC, GMT, EST…) for specific times.\n"
-            "📌 Relative times like <i>in 2 hours</i> don't need one.\n\n"
             "I'll ping the group at 24h, 6h, 1h, and 10min before! 🚀",
             parse_mode="HTML",
         )
         return
 
-    # Validate timezone before hitting Gemini
+    # Require a timezone for absolute times before hitting Gemini
     tz_ok, tz_error = check_timezone_requirement(raw)
     if not tz_ok:
         await message.reply_text(tz_error, parse_mode="HTML")
