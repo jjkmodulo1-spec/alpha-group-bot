@@ -7,11 +7,12 @@ import os
 import random
 import re
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 import uuid
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -114,6 +115,7 @@ def load_config():
 def save_config():
     import tempfile
     dir_ = os.path.dirname(os.path.abspath(CONFIG_FILE))
+    os.makedirs(dir_, exist_ok=True)
     with tempfile.NamedTemporaryFile("w", dir=dir_, delete=False, suffix=".tmp", encoding="utf-8") as f:
         json.dump(_config, f)
         tmp = f.name
@@ -1322,6 +1324,8 @@ async def is_admin(update: Update) -> bool:
         return False
 
 async def is_trusted(update: Update) -> bool:
+    if not update.effective_user or not update.effective_chat:
+        return False
     return update.effective_user.id in get_trusted_users(update.effective_chat.id)
 
 
@@ -1636,6 +1640,94 @@ _ABSOLUTE_TIME_RE = re.compile(
 )
 
 
+_TZ_OFFSETS: dict[str, timedelta] = {
+    "UTC": timedelta(0),
+    "GMT": timedelta(0),
+    "EST": timedelta(hours=-5),
+    "EDT": timedelta(hours=-4),
+    "CST": timedelta(hours=-6),
+    "CDT": timedelta(hours=-5),
+    "MST": timedelta(hours=-7),
+    "MDT": timedelta(hours=-6),
+    "PST": timedelta(hours=-8),
+    "PDT": timedelta(hours=-7),
+    "CET": timedelta(hours=1),
+    "CEST": timedelta(hours=2),
+    "EET": timedelta(hours=2),
+    "EEST": timedelta(hours=3),
+    "BST": timedelta(hours=1),
+    "IST": timedelta(hours=5, minutes=30),
+    "JST": timedelta(hours=9),
+    "KST": timedelta(hours=9),
+    "AEST": timedelta(hours=10),
+    "AEDT": timedelta(hours=11),
+    "NZST": timedelta(hours=12),
+    "NZDT": timedelta(hours=13),
+    "HKT": timedelta(hours=8),
+    "SGT": timedelta(hours=8),
+    "WIB": timedelta(hours=7),
+    "WITA": timedelta(hours=8),
+    "WIT": timedelta(hours=9),
+    "MSK": timedelta(hours=3),
+    "AST": timedelta(hours=-4),
+    "NST": timedelta(hours=-3, minutes=-30),
+    "NDT": timedelta(hours=-2, minutes=-30),
+    "ART": timedelta(hours=-3),
+    "BRT": timedelta(hours=-3),
+    "CLT": timedelta(hours=-4),
+    "PET": timedelta(hours=-5),
+    "VET": timedelta(hours=-4),
+    "COT": timedelta(hours=-5),
+    "ECT": timedelta(hours=-5),
+    "BOT": timedelta(hours=-4),
+    "UYT": timedelta(hours=-3),
+    "PYT": timedelta(hours=-4),
+    "GYT": timedelta(hours=-4),
+    "SRT": timedelta(hours=-3),
+    "TRT": timedelta(hours=3),
+    "EAT": timedelta(hours=3),
+    "WAT": timedelta(hours=1),
+    "CAT": timedelta(hours=2),
+}
+
+_MONTHS: dict[str, int] = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
+
+_WEEKDAYS: dict[str, int] = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+
+
 def check_timezone_requirement(text: str) -> tuple[bool, str | None]:
     """Check whether the alarm text needs a timezone and has one.
 
@@ -1644,6 +1736,7 @@ def check_timezone_requirement(text: str) -> tuple[bool, str | None]:
     - If absolute time detected without a timezone → ok=False with a helpful message.
     - If timezone present → ok=True.
     """
+    text = _normalise_alarm_input(text)
     has_tz = bool(_TZ_RE.search(text))
     if has_tz:
         return True, None
@@ -1723,9 +1816,12 @@ def _normalise_alarm_input(text: str) -> str:
     """Pre-process user input before sending to Gemini.
 
     Fixes common ambiguous patterns that confuse the model:
+    - superscript/full-width digits -> normal ASCII digits
     - '13:00pm' → '13:00'  (13 is already PM in 24h; trailing 'pm' is nonsense)
     - '1:00am'  → '01:00'  is fine, leave alone
     """
+    text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", text)
     # Remove 'pm'/'am' suffix when the hour is already unambiguous (13-23)
     text = re.sub(
         r"\b([1][3-9]|2[0-3])(?::(\d{2}))?\s*(?:pm|am)\b",
@@ -1734,6 +1830,241 @@ def _normalise_alarm_input(text: str) -> str:
         flags=re.IGNORECASE,
     )
     return text
+
+
+def _timezone_from_alarm_text(text: str):
+    match = _TZ_RE.search(text)
+    if not match:
+        return timezone.utc
+
+    token = match.group(0).upper()
+    offset_match = re.fullmatch(r"([+-])(\d{2}):?(\d{2})", token)
+    if offset_match:
+        sign = 1 if offset_match.group(1) == "+" else -1
+        hours = int(offset_match.group(2))
+        minutes = int(offset_match.group(3))
+        return timezone(sign * timedelta(hours=hours, minutes=minutes), token)
+
+    offset = _TZ_OFFSETS.get(token)
+    if offset is None:
+        return timezone.utc
+    return timezone(offset, token)
+
+
+def _parse_alarm_time_of_day(text: str) -> tuple[int, int] | None:
+    if re.search(r"\bnoon|midday\b", text, re.IGNORECASE):
+        return 12, 0
+    if re.search(r"\bmidnight\b", text, re.IGNORECASE):
+        return 0, 0
+
+    match = re.search(r"\b(\d{1,2}):(\d{2})\s*(am|pm)?\b", text, re.IGNORECASE)
+    if match:
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        ampm = (match.group(3) or "").lower()
+        if minute > 59 or hour > 23:
+            return None
+        if ampm == "pm" and hour < 12:
+            hour += 12
+        elif ampm == "am" and hour == 12:
+            hour = 0
+        return hour, minute
+
+    match = re.search(r"\b(\d{1,2})\s*(am|pm)\b", text, re.IGNORECASE)
+    if match:
+        hour = int(match.group(1))
+        ampm = match.group(2).lower()
+        if hour > 12:
+            return None
+        if ampm == "pm" and hour < 12:
+            hour += 12
+        elif ampm == "am" and hour == 12:
+            hour = 0
+        return hour, 0
+
+    return None
+
+
+def _date_from_alarm_text(text: str, now_local: datetime) -> tuple[int, int, int] | None:
+    lower = text.lower()
+    if re.search(r"\btomorrow\b", lower):
+        target = now_local.date() + timedelta(days=1)
+        return target.year, target.month, target.day
+    if re.search(r"\btonight\b", lower):
+        target = now_local.date()
+        return target.year, target.month, target.day
+
+    weekday_match = re.search(
+        r"\b(next\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        lower,
+    )
+    if weekday_match:
+        target_weekday = _WEEKDAYS[weekday_match.group(2)]
+        days_ahead = (target_weekday - now_local.weekday()) % 7
+        if weekday_match.group(1) or days_ahead == 0:
+            days_ahead += 7
+        target = now_local.date() + timedelta(days=days_ahead)
+        return target.year, target.month, target.day
+
+    month_match = re.search(
+        r"\b("
+        r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+        r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?|tember)?|oct(?:ober)?|"
+        r"nov(?:ember)?|dec(?:ember)?"
+        r")\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s*,?\s*(\d{4}))?\b",
+        lower,
+    )
+    if month_match:
+        month = _MONTHS[month_match.group(1)]
+        day = int(month_match.group(2))
+        year = int(month_match.group(3)) if month_match.group(3) else now_local.year
+        if not month_match.group(3):
+            try:
+                candidate = datetime(year, month, day, tzinfo=now_local.tzinfo)
+                if candidate.date() < now_local.date():
+                    year += 1
+            except ValueError:
+                return None
+        return year, month, day
+
+    numeric_match = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", lower)
+    if numeric_match:
+        month = int(numeric_match.group(1))
+        day = int(numeric_match.group(2))
+        year_raw = numeric_match.group(3)
+        year = int(year_raw) if year_raw else now_local.year
+        if year < 100:
+            year += 2000
+        if not year_raw:
+            try:
+                candidate = datetime(year, month, day, tzinfo=now_local.tzinfo)
+                if candidate.date() < now_local.date():
+                    year += 1
+            except ValueError:
+                return None
+        return year, month, day
+
+    return None
+
+
+def _parse_relative_alarm_time(text: str, now_utc: datetime) -> float | None:
+    match = re.search(
+        r"\bin\s+(\d+)\s*(second|minute|min|hour|hr|day|week|month)s?\b"
+        r"|\b(\d+)\s*(second|minute|min|hour|hr|day|week|month)s?\s+(?:from\s+now|later)\b",
+        text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    amount = int(match.group(1) or match.group(3))
+    unit = (match.group(2) or match.group(4)).lower()
+    if unit.startswith("second"):
+        delta = timedelta(seconds=amount)
+    elif unit in {"minute", "min"}:
+        delta = timedelta(minutes=amount)
+    elif unit in {"hour", "hr"}:
+        delta = timedelta(hours=amount)
+    elif unit == "day":
+        delta = timedelta(days=amount)
+    elif unit == "week":
+        delta = timedelta(weeks=amount)
+    else:
+        delta = timedelta(days=30 * amount)
+    return (now_utc + delta).timestamp()
+
+
+def _fallback_alarm_label(text: str) -> str:
+    text = _normalise_alarm_input(text)
+    text = re.sub(r"^/alarm(?:@\w+)?\s+", "", text, flags=re.IGNORECASE)
+    handle_match = re.search(r"@[A-Za-z0-9_]{2,}", text)
+    handle = handle_match.group(0) if handle_match else ""
+
+    event_words = [
+        ("airdrop", "Airdrop"),
+        ("claim", "Claim"),
+        ("whitelist", "Whitelist"),
+        ("wl", "WL"),
+        ("mint", "Mint"),
+        ("space", "Twitter Space"),
+        ("ama", "AMA"),
+        ("listing", "Listing"),
+        ("launch", "Launch"),
+        ("snapshot", "Snapshot"),
+        ("unlock", "Unlock"),
+        ("migration", "Migration"),
+    ]
+    found = []
+    lower = text.lower()
+    for needle, label in event_words:
+        if re.search(rf"\b{re.escape(needle)}\b", lower):
+            found.append(label)
+
+    if handle and found:
+        event = " ".join(dict.fromkeys(found[-2:]))
+        if "WL" in found and "Mint" in found:
+            event = "WL Mint"
+        return f"{handle} {event}"[:80]
+
+    cleaned = re.sub(r"https?://\S+", "", text)
+    cleaned = re.sub(r"\b(?:date|wl|mint price|collection page|total supply)\s*:\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(_TZ_RE, "", cleaned)
+    cleaned = re.sub(r"\b\d{1,2}:\d{2}\s*(?:am|pm)?\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -:,.")
+    return (cleaned[:80].strip() or "Alarm")
+
+
+def parse_alarm_locally(raw_text: str) -> dict | None:
+    """Parse common alarm formats without relying on Gemini."""
+    text = _normalise_alarm_input(raw_text)
+    now_utc = datetime.now(timezone.utc)
+
+    relative_fire_at = _parse_relative_alarm_time(text, now_utc)
+    if relative_fire_at is not None:
+        return {
+            "label": _fallback_alarm_label(raw_text),
+            "fire_at": relative_fire_at,
+            "confidence": 1.0,
+        }
+
+    tz = _timezone_from_alarm_text(text)
+    now_local = now_utc.astimezone(tz)
+    time_parts = _parse_alarm_time_of_day(text)
+    if not time_parts:
+        return None
+
+    date_parts = _date_from_alarm_text(text, now_local)
+    if date_parts is None:
+        target_date = now_local.date()
+        if re.search(r"\btonight\b", text, re.IGNORECASE) and time_parts is None:
+            time_parts = (20, 0)
+    else:
+        target_date = datetime(*date_parts, tzinfo=tz).date()
+
+    try:
+        candidate = datetime(
+            target_date.year,
+            target_date.month,
+            target_date.day,
+            time_parts[0],
+            time_parts[1],
+            tzinfo=tz,
+        )
+    except ValueError:
+        return None
+
+    if date_parts is None and candidate <= now_local:
+        candidate += timedelta(days=1)
+
+    fire_at = candidate.astimezone(timezone.utc).timestamp()
+    if fire_at <= time.time():
+        return None
+
+    return {
+        "label": _fallback_alarm_label(raw_text),
+        "fire_at": fire_at,
+        "confidence": 1.0,
+    }
 
 
 def _sanity_check_parsed(raw_text: str, parsed: dict) -> bool:
@@ -1819,11 +2150,11 @@ def _gemini_extract_time(text: str, now_str: str, now_unix: int) -> dict:
         "- confidence: 1.0 = exact time clearly stated. 0.0 = no time found.\n\n"
         "Examples:\n"
         '  Input: "WL mint May 19, 2026 starting at 13:00 UTC"\n'
-        '  Output: {"fire_at_unix":1747656000,"confidence":0.99,"error":null}\n\n'
+        '  Output: {"fire_at_unix":1779195600,"confidence":0.99,"error":null}\n\n'
         '  Input: "airdrop claim in 2 hours"\n'
         f'  Output: {{"fire_at_unix":{now_unix + 7200},"confidence":0.98,"error":null}}\n\n'
-        '  Input: "space tonight 8pm EST"\n'
-        f'  Output: {{"fire_at_unix":{now_unix + 3600},"confidence":0.95,"error":null}}\n\n'
+        '  Input: "space May 20, 2026 8pm EST"\n'
+        '  Output: {"fire_at_unix":1779325200,"confidence":0.95,"error":null}\n\n'
         '  Input: "token launch soon maybe"\n'
         '  Output: {"fire_at_unix":null,"confidence":0.0,"error":"no specific time"}\n\n'
         f'Text to parse:\n"""\n{text}\n"""\n\n'
@@ -1910,6 +2241,9 @@ def parse_alarm_with_gemini(raw_text: str) -> dict | None:
     Returns {"label": str, "fire_at": float} or None on failure.
     """
     normalised = _normalise_alarm_input(raw_text)
+    local_result = parse_alarm_locally(raw_text)
+    if local_result:
+        return local_result
 
     now_utc = datetime.now(timezone.utc)
     now_unix = int(now_utc.timestamp())
@@ -1973,6 +2307,9 @@ async def cleanup_token_cache(context: ContextTypes.DEFAULT_TYPE):
         token_reply_cache.pop(k, None)
     if stale_keys:
         logger.debug(f"Purged {len(stale_keys)} stale token cache entries.")
+
+
+async def fire_countdown(context: ContextTypes.DEFAULT_TYPE):
     """Sends a pre-event reminder at a checkpoint (24h / 6h / 1h / 10min before)."""
     data = context.job.data
     alarm_id = data["alarm_id"]
@@ -2483,6 +2820,11 @@ def main():
         .post_init(post_init)
         .build()
     )
+    if app.job_queue is None:
+        raise RuntimeError(
+            "Telegram JobQueue is unavailable. Install dependencies with "
+            "`pip install -r requirements.txt` so alarm scheduling works."
+        )
     # Block all commands and messages in private DMs
     GROUP_FILTER = filters.ChatType.GROUPS | filters.ChatType.CHANNEL
 
