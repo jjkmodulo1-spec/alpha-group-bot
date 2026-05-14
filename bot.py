@@ -1727,6 +1727,11 @@ _WEEKDAYS: dict[str, int] = {
     "sunday": 6,
 }
 
+_ALARM_URL_RE = re.compile(
+    r"\b(?:https?://)?(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?:/[^\s<>()]*)?",
+    re.IGNORECASE,
+)
+
 
 def check_timezone_requirement(text: str) -> tuple[bool, str | None]:
     """Check whether the alarm text needs a timezone and has one.
@@ -2012,6 +2017,160 @@ def _fallback_alarm_label(text: str) -> str:
     cleaned = re.sub(r"\b\d{1,2}:\d{2}\s*(?:am|pm)?\b", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" -:,.")
     return (cleaned[:80].strip() or "Alarm")
+
+
+def _strip_alarm_command(text: str) -> str:
+    return re.sub(r"^/alarm(?:@\w+)?\s+", "", text.strip(), flags=re.IGNORECASE)
+
+
+def _clean_alarm_field(value: str) -> str:
+    value = html.unescape(_normalise_alarm_input(value))
+    value = re.sub(r"\s+", " ", value).strip(" -:;,.")
+    return value[:120]
+
+
+def _extract_alarm_link(text: str) -> dict | None:
+    for match in _ALARM_URL_RE.finditer(text):
+        raw = match.group(0).strip().rstrip(".,;:)]}")
+        if not raw or raw.lower().startswith(("t.me/", "telegram.me/")):
+            continue
+        url = raw if raw.lower().startswith(("http://", "https://")) else f"https://{raw}"
+        parsed = urllib.parse.urlparse(url)
+        if not parsed.netloc:
+            continue
+        label = parsed.netloc.removeprefix("www.")
+        if parsed.path and parsed.path != "/":
+            label += parsed.path.rstrip("/")
+        return {"label": label[:70], "url": url}
+    return None
+
+
+_ALARM_FIELD_BOUNDARY_RE = re.compile(
+    r"\b(?:date|time|collection\s+page|link|page|total\s+supply|supply|"
+    r"mint\s+price|mint\s+cost|price|wl|whitelist|allowlist|public|presale|sale|"
+    r"mint\s+amount|mint\s+limit|max\s+mint|per\s+wallet|wallet\s+limit|amount)"
+    r"\s*[:=\-]",
+    re.IGNORECASE,
+)
+
+
+def _extract_labeled_alarm_values(text: str, labels: list[str]) -> list[tuple[str, str]]:
+    label_pattern = "|".join(labels)
+    pattern = re.compile(
+        rf"\b({label_pattern})\s*[:=\-]\s*",
+        re.IGNORECASE,
+    )
+
+    values = []
+    for match in pattern.finditer(text):
+        start = match.end()
+        boundary = _ALARM_FIELD_BOUNDARY_RE.search(text, start)
+        end = boundary.start() if boundary else len(text)
+        value = text[start:end]
+        value = re.split(
+            r"\b(?:starting|starts|start|begins|begin|at)\b",
+            value,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+        label = _clean_alarm_field(match.group(1)).upper()
+        value = _clean_alarm_field(value)
+        if value:
+            values.append((label, value))
+    return values
+
+
+def _extract_labeled_alarm_value(
+    text: str,
+    labels: list[str],
+    *,
+    prefer_price: bool = False,
+) -> tuple[str, str] | None:
+    values = _extract_labeled_alarm_values(text, labels)
+    if prefer_price:
+        for label, value in values:
+            if re.search(
+                r"\$\s*\d|\b\d+(?:\.\d+)?\s*"
+                r"(?:ETH|SOL|BTC|USDC|USDT|MATIC|BNB|AVAX|APE|BASE|USD)\b",
+                value,
+                re.IGNORECASE,
+            ):
+                return label, value
+        for label, value in values:
+            if re.search(r"\b(?:free|tba|tbd|gtd)\b", value, re.IGNORECASE):
+                return label, value
+    return values[0] if values else None
+
+
+def extract_alarm_details(raw_text: str) -> dict:
+    """Extract useful event metadata to carry through alarm reminders."""
+    text = _strip_alarm_command(_normalise_alarm_input(raw_text))
+    details: dict[str, object] = {}
+
+    link = _extract_alarm_link(text)
+    if link:
+        details["link"] = link
+
+    mint_value = _extract_labeled_alarm_value(
+        text,
+        [
+            r"mint\s+price",
+            r"mint\s+cost",
+            r"price",
+            r"wl",
+            r"whitelist",
+            r"allowlist",
+            r"public",
+            r"presale",
+            r"sale",
+        ],
+        prefer_price=True,
+    )
+    if mint_value:
+        label, value = mint_value
+        details["mint"] = f"{label}: {value}"
+
+    amount_value = _extract_labeled_alarm_value(
+        text,
+        [
+            r"mint\s+amount",
+            r"mint\s+limit",
+            r"max\s+mint",
+            r"per\s+wallet",
+            r"wallet\s+limit",
+            r"total\s+supply",
+            r"supply",
+            r"amount",
+        ],
+    )
+    if amount_value:
+        label, value = amount_value
+        label = "SUPPLY" if label == "TOTAL SUPPLY" else label
+        details["amount"] = f"{label}: {value}"
+
+    return details
+
+
+def format_alarm_details(details: dict | None) -> str:
+    if not details:
+        return ""
+
+    lines = []
+    mint = details.get("mint")
+    if mint:
+        lines.append(f"💸 {html.escape(str(mint))}")
+
+    amount = details.get("amount")
+    if amount:
+        lines.append(f"🔢 {html.escape(str(amount))}")
+
+    link = details.get("link")
+    if isinstance(link, dict) and link.get("url"):
+        label = html.escape(str(link.get("label") or "Open link"))
+        url = html.escape(str(link["url"]), quote=True)
+        lines.append(f'🔗 <a href="{url}">{label}</a>')
+
+    return "\n".join(lines)
 
 
 def parse_alarm_locally(raw_text: str) -> dict | None:
@@ -2364,6 +2523,9 @@ async def fire_countdown(context: ContextTypes.DEFAULT_TYPE):
         f"{cp_emoji} <b>{cp_label} until:</b> {evt_emoji} <b>{label}</b>\n"
         f"🕐 Fires at {fire_str} — use /alarms to see all events"
     )
+    details_html = format_alarm_details(alarm.get("details"))
+    if details_html:
+        text += f"\n{details_html}"
 
     try:
         await context.bot.send_message(
@@ -2468,6 +2630,9 @@ async def fire_alarm(context: ContextTypes.DEFAULT_TYPE):
     main_text = await asyncio.to_thread(
         generate_alarm_fire_message, raw_label, creator_mention, emoji
     )
+    details_html = format_alarm_details(alarm.get("details"))
+    if details_html:
+        main_text += f"\n\n{details_html}"
 
     try:
         await context.bot.send_message(
@@ -2528,6 +2693,7 @@ async def _create_and_confirm_alarm(
     *,
     natural: bool = False,
     created_by_id: int | None = None,
+    details: dict | None = None,
 ) -> None:
     """Persist + schedule an alarm and reply with a confirmation."""
     alarm_id = str(uuid.uuid4())[:8]
@@ -2541,6 +2707,8 @@ async def _create_and_confirm_alarm(
         "created_by_id": created_by_id,  # always compare by ID, not username
         "created_at": time.time(),
     }
+    if details:
+        alarm["details"] = details
     save_alarm(alarm)
     schedule_alarm(alarm, application)
 
@@ -2561,6 +2729,9 @@ async def _create_and_confirm_alarm(
         f"🕐 <b>{fire_str}</b>\n"
         f"⏱ In <b>{format_duration(seconds_until)}</b>\n"
     )
+    details_html = format_alarm_details(details)
+    if details_html:
+        reply += f"{details_html}\n"
     if notify_line:
         reply += f"{notify_line}\n"
     reply += f"\nID: <code>{alarm_id}</code>"
@@ -2697,9 +2868,10 @@ async def cmd_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     created_by = (user.username or user.first_name or str(user.id)) if user else "unknown"
     created_by_id = user.id if user else None
+    details = extract_alarm_details(raw)
     await _create_and_confirm_alarm(
         message, context.application, parsed["label"], parsed["fire_at"],
-        created_by, created_by_id=created_by_id,
+        created_by, created_by_id=created_by_id, details=details,
     )
 
 
@@ -2729,6 +2901,9 @@ async def cmd_alarms(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"   🕐 {fire_str} — in {format_duration(remaining)}\n"
             f"   👤 @{creator} • ID: <code>{alarm_id}</code>"
         )
+        detail_lines = format_alarm_details(alarm.get("details")).splitlines()
+        if detail_lines:
+            lines[-1] += "\n   " + "\n   ".join(detail_lines)
 
     await message.reply_text("\n\n".join(lines), parse_mode="HTML")
 
